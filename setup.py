@@ -90,7 +90,7 @@ setup(
         'extras': EXTRAS_REQUIRE,
         'test': EXTRAS_REQUIRE + [
             'nbval',
-            'pytest>=3.5',
+            'pytest==3.7',
             'pytest-cov',
             'scipy>=0.19.0',
         ],
