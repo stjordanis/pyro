@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 from torch.distributions import constraints
@@ -12,7 +13,7 @@ class MaskedConstraint(constraints.Constraint):
     """
     Combines two constraints interleaved elementwise by a mask.
 
-    :param torch.Tensor mask: boolean mask tensor (of dtype ``torch.uint8``)
+    :param torch.Tensor mask: boolean mask tensor (of dtype ``torch.bool``)
     :param torch.constraints.Constraint constraint0: constraint that holds
         wherever ``mask == 0``
     :param torch.constraints.Constraint constraint1: constraint that holds
@@ -57,8 +58,8 @@ class MaskedMixture(TorchDistribution):
     arg_constraints = {}  # nothing can be constrained
 
     def __init__(self, mask, component0, component1, validate_args=None):
-        if not torch.is_tensor(mask) or mask.dtype != torch.uint8:
-            raise ValueError('Expected mask to be a ByteTensor but got {}'.format(type(mask)))
+        if not torch.is_tensor(mask) or mask.dtype != torch.bool:
+            raise ValueError('Expected mask to be a BoolTensor but got {}'.format(type(mask)))
         if component0.event_shape != component1.event_shape:
             raise ValueError('components event_shape disagree: {} vs {}'
                              .format(component0.event_shape, component1.event_shape))
@@ -73,7 +74,7 @@ class MaskedMixture(TorchDistribution):
         self.mask = mask
         self.component0 = component0
         self.component1 = component1
-        super(MaskedMixture, self).__init__(batch_shape, component0.event_shape, validate_args)
+        super().__init__(batch_shape, component0.event_shape, validate_args)
 
         # We need to disable _validate_sample on each component since samples are only valid on the
         # component from which they are drawn. Instead we perform validation using a MaskedConstraint.
@@ -92,7 +93,7 @@ class MaskedMixture(TorchDistribution):
 
     def expand(self, batch_shape):
         try:
-            return super(MaskedMixture, self).expand(batch_shape)
+            return super().expand(batch_shape)
         except NotImplementedError:
             mask = self.mask.expand(batch_shape)
             component0 = self.component0.expand(batch_shape)
@@ -100,15 +101,19 @@ class MaskedMixture(TorchDistribution):
             return type(self)(mask, component0, component1)
 
     def sample(self, sample_shape=torch.Size()):
-        mask = self.mask.expand(sample_shape + self.batch_shape) if sample_shape else self.mask
-        result = self.component0.sample(sample_shape)
-        result[mask] = self.component1.sample(sample_shape)[mask]
+        mask = self.mask.reshape(self.mask.shape + (1,) * self.event_dim)
+        mask = mask.expand(sample_shape + self.shape())
+        result = torch.where(mask,
+                             self.component1.sample(sample_shape),
+                             self.component0.sample(sample_shape))
         return result
 
     def rsample(self, sample_shape=torch.Size()):
-        mask = self.mask.expand(sample_shape + self.batch_shape) if sample_shape else self.mask
-        result = self.component0.rsample(sample_shape)
-        result[mask] = self.component1.rsample(sample_shape)[mask]
+        mask = self.mask.reshape(self.mask.shape + (1,) * self.event_dim)
+        mask = mask.expand(sample_shape + self.shape())
+        result = torch.where(mask,
+                             self.component1.rsample(sample_shape),
+                             self.component0.rsample(sample_shape))
         return result
 
     def log_prob(self, value):
@@ -121,8 +126,9 @@ class MaskedMixture(TorchDistribution):
         mask = self.mask
         if mask.shape != mask_shape:
             mask = mask.expand(mask_shape)
-        result = self.component0.log_prob(value)
-        result[mask] = self.component1.log_prob(value)[mask]
+        result = torch.where(mask,
+                             self.component1.log_prob(value),
+                             self.component0.log_prob(value))
         return result
 
     @lazy_property

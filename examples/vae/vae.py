@@ -1,3 +1,6 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 
 import numpy as np
@@ -18,7 +21,7 @@ from utils.vae_plots import mnist_test_tsne, plot_llk, plot_vae_samples
 # diagonal gaussian distribution q(z|x)
 class Encoder(nn.Module):
     def __init__(self, z_dim, hidden_dim):
-        super(Encoder, self).__init__()
+        super().__init__()
         # setup the three linear transformations used
         self.fc1 = nn.Linear(784, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, z_dim)
@@ -43,7 +46,7 @@ class Encoder(nn.Module):
 # observation likelihood p(x|z)
 class Decoder(nn.Module):
     def __init__(self, z_dim, hidden_dim):
-        super(Decoder, self).__init__()
+        super().__init__()
         # setup the two linear transformations used
         self.fc1 = nn.Linear(z_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, 784)
@@ -65,7 +68,7 @@ class VAE(nn.Module):
     # by default our latent space is 50-dimensional
     # and we use 400 hidden units
     def __init__(self, z_dim=50, hidden_dim=400, use_cuda=False):
-        super(VAE, self).__init__()
+        super().__init__()
         # create the encoder and decoder networks
         self.encoder = Encoder(z_dim, hidden_dim)
         self.decoder = Decoder(z_dim, hidden_dim)
@@ -83,14 +86,14 @@ class VAE(nn.Module):
         pyro.module("decoder", self.decoder)
         with pyro.plate("data", x.shape[0]):
             # setup hyperparameters for prior p(z)
-            z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
-            z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
+            z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
+            z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
             # sample from prior (value will be sampled by guide when computing the ELBO)
-            z = pyro.sample("latent", dist.Normal(z_loc, z_scale).independent(1))
+            z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
             # decode the latent code z
             loc_img = self.decoder.forward(z)
             # score against actual images
-            pyro.sample("obs", dist.Bernoulli(loc_img).independent(1), obs=x.reshape(-1, 784))
+            pyro.sample("obs", dist.Bernoulli(loc_img).to_event(1), obs=x.reshape(-1, 784))
             # return the loc so we can visualize it later
             return loc_img
 
@@ -102,7 +105,7 @@ class VAE(nn.Module):
             # use the encoder to get the parameters used to define q(z|x)
             z_loc, z_scale = self.encoder.forward(x)
             # sample the latent code z
-            pyro.sample("latent", dist.Normal(z_loc, z_scale).independent(1))
+            pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
     # define a helper function for reconstructing images
     def reconstruct_img(self, x):
@@ -198,6 +201,7 @@ def main(args):
 
 
 if __name__ == '__main__':
+    assert pyro.__version__.startswith('1.3.1')
     # parse command line arguments
     parser = argparse.ArgumentParser(description="parse args")
     parser.add_argument('-n', '--num-epochs', default=101, type=int, help='number of training epochs')

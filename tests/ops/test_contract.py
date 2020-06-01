@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import itertools
 import numbers
@@ -8,12 +9,14 @@ import opt_einsum
 import pytest
 import torch
 
+import pyro.ops.jit
 from pyro.distributions.util import logsumexp
-from pyro.ops.contract import (UnpackedLogRing, _partition_terms, contract_tensor_tree, contract_to_tensor,
-                               naive_ubersum, ubersum)
+from pyro.ops.contract import _partition_terms, contract_tensor_tree, contract_to_tensor, einsum, naive_ubersum, ubersum
+from pyro.ops.einsum.adjoint import require_backward
+from pyro.ops.rings import LogRing
 from pyro.poutine.indep_messenger import CondIndepStackFrame
 from pyro.util import optional
-from tests.common import assert_equal, xfail_param
+from tests.common import assert_equal
 
 
 def deep_copy(x):
@@ -26,6 +29,8 @@ def deep_copy(x):
         return type(x)(deep_copy(value) for value in x)
     if isinstance(x, (dict, OrderedDict)):
         return type(x)((deep_copy(key), deep_copy(value)) for key, value in x.items())
+    if isinstance(x, str):
+        return x
     raise TypeError(type(x))
 
 
@@ -69,30 +74,42 @@ def assert_immutable(fn):
     return checked_fn
 
 
-@pytest.mark.parametrize('shapes,dims,expected_num_components', [
-    ([()], set(), 1),
-    ([(2,)], set(), 1),
-    ([(2,)], set([-1]), 1),
-    ([(2,), (2,)], set(), 2),
-    ([(2,), (2,)], set([-1]), 1),
-    ([(2, 1), (2, 1), (1, 3), (1, 3)], set(), 4),
-    ([(2, 1), (2, 1), (1, 3), (1, 3)], set([-1]), 3),
-    ([(2, 1), (2, 1), (1, 3), (1, 3)], set([-2]), 3),
-    ([(2, 1), (2, 1), (1, 3), (1, 3)], set([-1, -2]), 2),
-    ([(2, 1), (2, 3), (1, 3)], set(), 3),
-    ([(2, 1), (2, 3), (1, 3)], set([-1]), 2),
-    ([(2, 1), (2, 3), (1, 3)], set([-2]), 2),
-    ([(2, 1), (2, 3), (1, 3)], set([-1, -2]), 1),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set(), 4),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set([-1]), 3),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set([-2]), 3),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set([-3]), 3),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set([-1, -3]), 2),
-    ([(4, 1, 1), (4, 3, 1), (1, 3, 2), (1, 1, 2)], set([-1, -2, -3]), 1),
+def _normalize(tensor, dims, plates):
+    total = tensor
+    for i, dim in enumerate(dims):
+        if dim not in plates:
+            total = logsumexp(total, i, keepdim=True)
+    return tensor - total
+
+
+@pytest.mark.parametrize('inputs,dims,expected_num_components', [
+    ([''], set(), 1),
+    (['a'], set(), 1),
+    (['a'], set('a'), 1),
+    (['a', 'a'], set(), 2),
+    (['a', 'a'], set('a'), 1),
+    (['a', 'a', 'b', 'b'], set(), 4),
+    (['a', 'a', 'b', 'b'], set('a'), 3),
+    (['a', 'a', 'b', 'b'], set('b'), 3),
+    (['a', 'a', 'b', 'b'], set('ab'), 2),
+    (['a', 'ab', 'b'], set(), 3),
+    (['a', 'ab', 'b'], set('a'), 2),
+    (['a', 'ab', 'b'], set('b'), 2),
+    (['a', 'ab', 'b'], set('ab'), 1),
+    (['a', 'ab', 'bc', 'c'], set(), 4),
+    (['a', 'ab', 'bc', 'c'], set('c'), 3),
+    (['a', 'ab', 'bc', 'c'], set('b'), 3),
+    (['a', 'ab', 'bc', 'c'], set('a'), 3),
+    (['a', 'ab', 'bc', 'c'], set('ac'), 2),
+    (['a', 'ab', 'bc', 'c'], set('abc'), 1),
 ])
-def test_partition_terms_unpacked(shapes, dims, expected_num_components):
-    ring = UnpackedLogRing()
+def test_partition_terms(inputs, dims, expected_num_components):
+    ring = LogRing()
+    symbol_to_size = dict(zip('abc', [2, 3, 4]))
+    shapes = [tuple(symbol_to_size[s] for s in input_) for input_ in inputs]
     tensors = [torch.randn(shape) for shape in shapes]
+    for input_, tensor in zip(inputs, tensors):
+        tensor._pyro_dims = input_
     components = list(_partition_terms(ring, tensors, dims))
 
     # Check that result is a partition.
@@ -101,7 +118,7 @@ def test_partition_terms_unpacked(shapes, dims, expected_num_components):
     assert actual_terms == expected_terms
     assert dims == set.union(set(), *(c[1] for c in components))
 
-    # Check that partition is not too coarse.
+    # Check that the partition is not too coarse.
     assert len(components) == expected_num_components
 
     # Check that partition is not too fine.
@@ -109,8 +126,7 @@ def test_partition_terms_unpacked(shapes, dims, expected_num_components):
     for x in tensors:
         for y in tensors:
             if x is not y:
-                if any(dim >= -x.dim() and x.shape[dim] > 1 and
-                       dim >= -y.dim() and y.shape[dim] > 1 for dim in dims):
+                if dims.intersection(x._pyro_dims, y._pyro_dims):
                     assert component_dict[x] == component_dict[y]
 
 
@@ -119,182 +135,245 @@ def frame(dim, size):
 
 
 EXAMPLES = [
+    # ------------------------------------------------------
+    #  y      max_plate_nesting=1
+    #  | 4    x, y are enumerated in dims:
+    #  x      a, b
     {
         'shape_tree': {
-            (): [(2, 3, 1)],
-            (frame(-1, 4),): [(2, 3, 4)],
+            frozenset(): ['a'],
+            frozenset('i'): ['abi'],
         },
-        'sum_dims': [],
-        'target_ordinal': (),
-        'expected_shape': (2, 3, 1),
+        'sum_dims': set('ab'),
+        'target_dims': set(),
+        'target_ordinal': frozenset(),
+        'expected_dims': (),
     },
     {
         'shape_tree': {
-            (): [(2, 3, 1)],
-            (frame(-1, 4),): [(2, 3, 4)],
+            frozenset(): ['a'],
+            frozenset('i'): ['abi'],
         },
-        'sum_dims': [],
-        'target_ordinal': (frame(-1, 4),),
-        'expected_shape': (2, 3, 4),
+        'sum_dims': set('ab'),
+        'target_dims': set('a'),
+        'target_ordinal': frozenset(),
+        'expected_dims': 'a',
+    },
+    {
+        'shape_tree': {
+            frozenset(): ['a'],
+            frozenset('i'): ['abi'],
+        },
+        'sum_dims': set('ab'),
+        'target_dims': set('b'),
+        'target_ordinal': frozenset('i'),
+        'expected_dims': 'bi',
+    },
+    {
+        'shape_tree': {
+            frozenset(): ['a'],
+            frozenset('i'): ['abi'],
+        },
+        'sum_dims': set('ab'),
+        'target_dims': set('ab'),
+        'target_ordinal': frozenset('i'),
+        'expected_dims': 'abi',
     },
     # ------------------------------------------------------
     #          z
     #          | 4    max_plate_nesting=2
     #    x     y      w, x, y, z are all enumerated in dims:
-    #   2 \   / 3    -3 -4 -5 -6
+    #   2 \   / 3     a, b, c, d
     #       w
     {
         'shape_tree': {
-            (): [(2, 1, 1)],  # w
-            (frame(-1, 2),): [(2, 2, 1, 2)],  # x
-            (frame(-1, 3),): [(2, 1, 2, 1, 3)],  # y
-            (frame(-1, 3), frame(-2, 4)): [(2, 2, 1, 1, 4, 3)],  # z
+            frozenset(): ['a'],  # w
+            frozenset('i'): ['abi'],  # x
+            frozenset('j'): ['acj'],  # y
+            frozenset('ij'): ['cdij'],  # z
         },
         # query for w
-        'sum_dims': [-4, -5, -6],
-        'target_ordinal': (),
-        'expected_shape': (2, 1, 1),
+        'sum_dims': set('abcd'),
+        'target_dims': set('a'),
+        'target_ordinal': frozenset(),
+        'expected_dims': 'a',
     },
     {
         'shape_tree': {
-            (): [(2, 1, 1)],  # w
-            (frame(-1, 2),): [(2, 2, 1, 2)],  # x
-            (frame(-1, 3),): [(2, 1, 2, 1, 3)],  # y
-            (frame(-1, 3), frame(-2, 4)): [(2, 2, 1, 1, 4, 3)],  # z
+            frozenset(): ['a'],  # w
+            frozenset('i'): ['abi'],  # x
+            frozenset('j'): ['acj'],  # y
+            frozenset('ij'): ['cdij'],  # z
         },
         # query for x
-        'sum_dims': [-3, -5, -6],
-        'target_ordinal': (frame(-1, 2),),
-        'expected_shape': (2, 1, 1, 2),
+        'sum_dims': set('abcd'),
+        'target_dims': set('b'),
+        'target_ordinal': frozenset('i'),
+        'expected_dims': 'bi',
     },
     {
         'shape_tree': {
-            (): [(2, 1, 1)],  # w
-            (frame(-1, 2),): [(2, 2, 1, 2)],  # x
-            (frame(-1, 3),): [(2, 1, 2, 1, 3)],  # y
-            (frame(-1, 3), frame(-2, 4)): [(2, 2, 1, 1, 4, 3)],  # z
+            frozenset(): ['a'],  # w
+            frozenset('i'): ['abi'],  # x
+            frozenset('j'): ['acj'],  # y
+            frozenset('ij'): ['cdij'],  # z
         },
-        # query for x
-        'sum_dims': [-3, -4, -6],
-        'target_ordinal': (frame(-1, 3),),
-        'expected_shape': (2, 1, 1, 1, 3),
+        # query for y
+        'sum_dims': set('abcd'),
+        'target_dims': set('c'),
+        'target_ordinal': frozenset('j'),
+        'expected_dims': 'cj',
     },
     {
         'shape_tree': {
-            (): [(2, 1, 1)],  # w
-            (frame(-1, 2),): [(2, 2, 1, 2)],  # x
-            (frame(-1, 3),): [(2, 1, 2, 1, 3)],  # y
-            (frame(-1, 3), frame(-2, 4)): [(2, 2, 1, 1, 4, 3)],  # z
+            frozenset(): ['a'],  # w
+            frozenset('i'): ['abi'],  # x
+            frozenset('j'): ['acj'],  # y
+            frozenset('ij'): ['cdij'],  # z
         },
         # query for z
-        'sum_dims': [-3, -4, -5],
-        'target_ordinal': (frame(-1, 3), frame(-2, 4)),
-        'expected_shape': (2, 1, 1, 1, 4, 3),
+        'sum_dims': set('abcd'),
+        'target_dims': set('d'),
+        'target_ordinal': frozenset('ij'),
+        'expected_dims': 'dij',
     },
 ]
 
 
 @pytest.mark.parametrize('example', EXAMPLES)
 def test_contract_to_tensor(example):
-    tensor_tree = OrderedDict((frozenset(t), [torch.randn(shape) for shape in shapes])
-                              for t, shapes in example['shape_tree'].items())
-    sum_dims = {x: set(d for d in example['sum_dims'] if -d <= x.dim() and x.shape[d] > 1)
-                for terms in tensor_tree.values()
-                for x in terms}
-    target_ordinal = frozenset(example['target_ordinal'])
-    expected_shape = example['expected_shape']
+    symbol_to_size = dict(zip('abcdij', [4, 5, 6, 7, 2, 3]))
+    tensor_tree = OrderedDict()
+    for t, shapes in example['shape_tree'].items():
+        for dims in shapes:
+            tensor = torch.randn(tuple(symbol_to_size[s] for s in dims))
+            tensor._pyro_dims = dims
+            tensor_tree.setdefault(t, []).append(tensor)
+    sum_dims = example['sum_dims']
+    target_dims = example['target_dims']
+    target_ordinal = example['target_ordinal']
+    expected_dims = example['expected_dims']
 
-    actual = assert_immutable(contract_to_tensor)(tensor_tree, sum_dims, target_ordinal)
-    assert actual.shape == expected_shape
+    actual = assert_immutable(contract_to_tensor)(tensor_tree, sum_dims, target_ordinal, target_dims)
+    assert set(actual._pyro_dims) == set(expected_dims)
 
 
 @pytest.mark.parametrize('example', EXAMPLES)
 def test_contract_tensor_tree(example):
-    tensor_tree = OrderedDict((frozenset(t), [torch.randn(shape) for shape in shapes])
-                              for t, shapes in example['shape_tree'].items())
-    sum_dims = {x: set(d for d in example['sum_dims'] if -d <= x.dim() and x.shape[d] > 1)
-                for terms in tensor_tree.values()
-                for x in terms}
+    symbol_to_size = dict(zip('abcdij', [4, 5, 6, 7, 2, 3]))
+    tensor_tree = OrderedDict()
+    for t, shapes in example['shape_tree'].items():
+        for dims in shapes:
+            tensor = torch.randn(tuple(symbol_to_size[s] for s in dims))
+            tensor._pyro_dims = dims
+            tensor_tree.setdefault(t, []).append(tensor)
+    sum_dims = example['sum_dims']
 
-    actual = assert_immutable(contract_tensor_tree)(tensor_tree, sum_dims)
-    assert actual
-    for ordinal, terms in actual.items():
+    tensor_tree = assert_immutable(contract_tensor_tree)(tensor_tree, sum_dims)
+    assert tensor_tree
+    for ordinal, terms in tensor_tree.items():
         for term in terms:
             for frame in ordinal:
                 assert term.shape[frame.dim] == frame.size
 
 
-@pytest.mark.parametrize('a', [2, 1])
-@pytest.mark.parametrize('b', [3, 1])
-@pytest.mark.parametrize('c', [3, 1])
-@pytest.mark.parametrize('d', [4, 1])
-def test_contract_to_tensor_sizes(a, b, c, d):
-    X = torch.randn(a, 1, c, 1)
-    Y = torch.randn(a, b, 1, 1)
-    Z = torch.randn(b, 1, d)
-    tensor_tree = OrderedDict([(frozenset([frame(-2, c)]), [X]),
-                               (frozenset(), [Y]),
-                               (frozenset([frame(-1, d)]), [Z])])
-    sum_dims = {X: {-4}, Y: {-4, -3}, Z: {-3}}
-
-    target_ordinal = frozenset()
-    actual = contract_to_tensor(tensor_tree, sum_dims, target_ordinal)
-    assert actual.shape == ()
-
-    target_ordinal = frozenset([frame(-2, c)])
-    actual = contract_to_tensor(tensor_tree, sum_dims, target_ordinal)
-    assert actual.shape == (c, 1)
-
-    target_ordinal = frozenset([frame(-1, d)])
-    actual = contract_to_tensor(tensor_tree, sum_dims, target_ordinal)
-    assert actual.shape == (d,)
-
-
+# Let abcde be enum dims and ijk be plates.
 UBERSUM_EXAMPLES = [
     ('->', ''),
     ('a->,a', ''),
     ('ab->,a,b,ab,ba', ''),
     ('ab,bc->,a,b,c,ab,bc,ac,abc', ''),
     ('ab,bc,cd->,a,b,c,d,ab,ac,ad,bc,bd,cd,abc,acd,bcd,abcd', ''),
-    ('a->,a', 'a'),
-    (',a->,a', 'a'),
-    (',a,a->,a', 'a'),
-    (',a,ab->,a,ab', 'a'),
-    (',a,a,ab,ab->,a,ab', 'a'),
-    ('ca,ab->,a,ab,ac,abc', 'a'),
-    ('ac,bc,abc->,c,a,ac,b,bc,abc', 'ab'),
-    ('a,bd,abcd->,a,b,bd,ab,abc,abd,abcd', 'ab'),
-    ('ac,bd,abcd->,a,ac,b,bd,ab,abc,abd,abcd', 'ab'),
-    (',a,b,c,ab,ac,bc,abc->,c,a,b,ac,bc,ab,abc', 'ab'),
-    (',ad,abd,acd->,a,b,c,ab,ac,abc,ad,abd,acd,abcd', 'abc'),
+    ('i->,i', 'i'),
+    (',i->,i', 'i'),
+    (',i,i->,i', 'i'),
+    (',i,ia->,i,ia', 'i'),
+    (',i,i,ia,ia->,i,ia', 'i'),
+    ('bi,ia->,i,ia,ib,iab', 'i'),
+    ('abi,b->,b,ai,abi', 'i'),
+    ('ia,ja,ija->,a,i,ia,j,ja,ija', 'ij'),
+    ('i,jb,ijab->,i,j,jb,ij,ija,ijb,ijab', 'ij'),
+    ('ia,jb,ijab->,i,ia,j,jb,ij,ija,ijb,ijab', 'ij'),
+    (',i,j,a,ij,ia,ja,ija->,a,i,j,ia,ja,ij,ija', 'ij'),
+    ('a,b,c,di,ei,fj->,a,b,c,di,ei,fj', 'ij'),
+    # {ij}   {ik}
+    #   a\   /a
+    #     {i}
+    ('ija,ika->,i,j,k,ij,ik,ijk,ia,ija,ika,ijka', 'ijk'),
+    # {ij}   {ik}
+    #   a\   /a
+    #     {i}      {}
+    (',ia,ija,ika->,i,j,k,ij,ik,ijk,ia,ija,ika,ijka', 'ijk'),
+    #  {i} c
+    #   |b
+    #  {} a
+    ('ab,bci->,a,b,ab,i,ai,bi,ci,abi,bci,abci', 'i'),
+    #  {i} cd
+    #   |b
+    #  {} a
+    ('ab,bci,bdi->,a,b,ab,i,ai,bi,ci,abi,bci,bdi,cdi,abci,abdi,abcdi', 'i'),
+    #  {ij} c
+    #   |b
+    #  {} a
+    ('ab,bcij->,a,b,ab,i,j,ij,ai,aj,aij,bi,bj,aij,bij,cij,abij,acij,bcij,abcij', 'ij'),
+    #  {ij} c
+    #   |b
+    #  {i} a
+    ('abi,bcij->,i,ai,bi,abi,j,ij,aij,bij,cij,abij,bcij,abcij', 'ij'),
+    # {ij} e
+    #   |d
+    #  {i} c
+    #   |b
+    #  {} a
+    ('ab,bcdi,deij->,a,b,ci,di,eij', 'ij'),
+    # {ijk} g
+    #   |f
+    # {ij} e
+    #   |d
+    #  {i} c
+    #   |b
+    #  {} a
+    ('ab,bcdi,defij,fgijk->,a,b,ci,di,eij,fij,gijk', 'ijk'),
+    # {ik}  {ij}   {ij}
+    #   a\   /b    /e
+    #     {i}    {j}
+    #       c\  /d
+    #         {}
+    ('aik,bij,abci,cd,dej,eij->,ai,bi,ej,aik,bij,eij', 'ijk'),
+    # {ij}    {ij}
+    #  a|      |d
+    #  {i}    {j}
+    #    b\  /c
+    #      {}
+    ('aij,abi,bc,cdj,dij->,bi,cj,aij,dij,adij', 'ij'),
 ]
 
 
-def make_example(equation):
+def make_example(equation, fill=None, sizes=(2, 3)):
     symbols = sorted(set(equation) - set(',->'))
-    sizes = {dim: size for dim, size in zip(symbols, itertools.cycle([2, 3, 4]))}
+    sizes = {dim: size for dim, size in zip(symbols, itertools.cycle(sizes))}
     inputs, outputs = equation.split('->')
     inputs = inputs.split(',')
     outputs = outputs.split(',')
     operands = []
     for dims in inputs:
         shape = tuple(sizes[dim] for dim in dims)
-        operands.append(torch.randn(shape))
+        operands.append(torch.randn(shape) if fill is None else torch.full(shape, fill))
     return inputs, outputs, operands, sizes
 
 
-@pytest.mark.parametrize('equation,batch_dims', UBERSUM_EXAMPLES)
-def test_naive_ubersum(equation, batch_dims):
+@pytest.mark.parametrize('equation,plates', UBERSUM_EXAMPLES)
+def test_naive_ubersum(equation, plates):
     inputs, outputs, operands, sizes = make_example(equation)
 
-    actual = naive_ubersum(equation, *operands, batch_dims=batch_dims)
+    actual = naive_ubersum(equation, *operands, plates=plates)
 
     assert isinstance(actual, tuple)
     assert len(actual) == len(outputs)
     for output, actual_part in zip(outputs, actual):
         expected_shape = tuple(sizes[dim] for dim in output)
         assert actual_part.shape == expected_shape
-        if not batch_dims:
+        if not plates:
             equation_part = ','.join(inputs) + '->' + output
             expected_part = opt_einsum.contract(equation_part, *operands,
                                                 backend='pyro.ops.einsum.torch_log')
@@ -303,23 +382,97 @@ def test_naive_ubersum(equation, batch_dims):
                              output, expected_part.detach().cpu(), actual_part.detach().cpu()))
 
 
-@pytest.mark.xfail(reason='improper handling of batched output')
-@pytest.mark.parametrize('equation,batch_dims', UBERSUM_EXAMPLES)
-def test_ubersum(equation, batch_dims):
+@pytest.mark.parametrize('equation,plates', UBERSUM_EXAMPLES)
+def test_ubersum(equation, plates):
     inputs, outputs, operands, sizes = make_example(equation)
 
     try:
-        actual = ubersum(equation, *operands, batch_dims=batch_dims)
+        actual = ubersum(equation, *operands, plates=plates, modulo_total=True)
     except NotImplementedError:
         pytest.skip()
 
     assert isinstance(actual, tuple)
     assert len(actual) == len(outputs)
-    expected = naive_ubersum(equation, *operands, batch_dims=batch_dims)
+    expected = naive_ubersum(equation, *operands, plates=plates)
     for output, expected_part, actual_part in zip(outputs, expected, actual):
+        actual_part = _normalize(actual_part, output, plates)
+        expected_part = _normalize(expected_part, output, plates)
         assert_equal(expected_part, actual_part,
                      msg=u"For output '{}':\nExpected:\n{}\nActual:\n{}".format(
                          output, expected_part.detach().cpu(), actual_part.detach().cpu()))
+
+
+@pytest.mark.parametrize('equation,plates', UBERSUM_EXAMPLES)
+def test_einsum_linear(equation, plates):
+    inputs, outputs, log_operands, sizes = make_example(equation)
+    operands = [x.exp() for x in log_operands]
+
+    try:
+        log_expected = ubersum(equation, *log_operands, plates=plates, modulo_total=True)
+        expected = [x.exp() for x in log_expected]
+    except NotImplementedError:
+        pytest.skip()
+
+    # einsum() is in linear space whereas ubersum() is in log space.
+    actual = einsum(equation, *operands, plates=plates, modulo_total=True)
+    assert isinstance(actual, tuple)
+    assert len(actual) == len(outputs)
+    for output, expected_part, actual_part in zip(outputs, expected, actual):
+        assert_equal(expected_part.log(), actual_part.log(),
+                     msg=u"For output '{}':\nExpected:\n{}\nActual:\n{}".format(
+                         output, expected_part.detach().cpu(), actual_part.detach().cpu()))
+
+
+@pytest.mark.parametrize('equation,plates', UBERSUM_EXAMPLES)
+def test_ubersum_jit(equation, plates):
+    inputs, outputs, operands, sizes = make_example(equation)
+
+    try:
+        expected = ubersum(equation, *operands, plates=plates, modulo_total=True)
+    except NotImplementedError:
+        pytest.skip()
+
+    @pyro.ops.jit.trace
+    def jit_ubersum(*operands):
+        return ubersum(equation, *operands, plates=plates, modulo_total=True)
+
+    actual = jit_ubersum(*operands)
+
+    if not isinstance(actual, tuple):
+        pytest.xfail(reason="https://github.com/pytorch/pytorch/issues/14875")
+    assert len(expected) == len(actual)
+    for e, a in zip(expected, actual):
+        assert_equal(e, a)
+
+
+@pytest.mark.parametrize('equation,plates', [
+    ('i->', 'i'),
+    ('i->i', 'i'),
+    (',i->', 'i'),
+    (',i->i', 'i'),
+    ('ai->', 'i'),
+    ('ai->i', 'i'),
+    ('ai->ai', 'i'),
+    (',ai,abij->aij', 'ij'),
+    ('a,ai,bij->bij', 'ij'),
+    ('a,ai,abij->bij', 'ij'),
+    ('a,abi,bcij->a', 'ij'),
+    ('a,abi,bcij->bi', 'ij'),
+    ('a,abi,bcij->bij', 'ij'),
+    ('a,abi,bcij->cij', 'ij'),
+    ('ab,bcdi,deij->eij', 'ij'),
+])
+def test_ubersum_total(equation, plates):
+    inputs, outputs, operands, sizes = make_example(equation, fill=1., sizes=(2,))
+    output = outputs[0]
+
+    expected = naive_ubersum(equation, *operands, plates=plates)[0]
+    actual = ubersum(equation, *operands, plates=plates, modulo_total=True)[0]
+    expected = _normalize(expected, output, plates)
+    actual = _normalize(actual, output, plates)
+    assert_equal(expected, actual,
+                 msg=u"Expected:\n{}\nActual:\n{}".format(
+                     expected.detach().cpu(), actual.detach().cpu()))
 
 
 @pytest.mark.parametrize('a', [2, 1])
@@ -331,7 +484,7 @@ def test_ubersum_sizes(impl, a, b, c, d):
     X = torch.randn(a, b)
     Y = torch.randn(b, c)
     Z = torch.randn(c, d)
-    actual = impl('ab,bc,cd->a,b,c,d', X, Y, Z, batch_dims='ad')
+    actual = impl('ab,bc,cd->a,b,c,d', X, Y, Z, plates='ad', modulo_total=True)
     actual_a, actual_b, actual_c, actual_d = actual
     assert actual_a.shape == (a,)
     assert actual_b.shape == (b,)
@@ -348,7 +501,7 @@ def test_ubersum_1(impl):
     x = torch.randn(c)
     y = torch.randn(c, d, a)
     z = torch.randn(e, c, b)
-    actual, = impl('c,cda,ecb->', x, y, z, batch_dims='ab')
+    actual, = impl('c,cda,ecb->', x, y, z, plates='ab', modulo_total=True)
     expected = logsumexp(x + logsumexp(y, -2).sum(-1) + logsumexp(z, -3).sum(-1), -1)
     assert_equal(actual, expected)
 
@@ -362,7 +515,7 @@ def test_ubersum_2(impl):
     x = torch.randn(c)
     y = torch.randn(c, d, a)
     z = torch.randn(e, c, b)
-    actual, = impl('c,cda,ecb->b', x, y, z, batch_dims='ab')
+    actual, = impl('c,cda,ecb->b', x, y, z, plates='ab', modulo_total=True)
     xyz = logsumexp(x + logsumexp(y, -2).sum(-1) + logsumexp(z, -3).sum(-1), -1)
     expected = xyz.expand(b)
     assert_equal(actual, expected)
@@ -380,7 +533,7 @@ def test_ubersum_3(impl):
     x = torch.randn(d)
     y = torch.randn(b, d)
     z = torch.randn(b, c, d, e)
-    actual, = impl('ae,d,bd,bcde->be', w, x, y, z, batch_dims='abc')
+    actual, = impl('ae,d,bd,bcde->be', w, x, y, z, plates='abc', modulo_total=True)
     yz = y.reshape(b, d, 1) + z.sum(-3)  # eliminate c
     assert yz.shape == (b, d, e)
     yz = yz.sum(0)  # eliminate b
@@ -393,10 +546,7 @@ def test_ubersum_3(impl):
     assert_equal(actual, expected)
 
 
-@pytest.mark.parametrize('impl', [
-    naive_ubersum,
-    xfail_param(ubersum, reason='incorrect forward-backward implementation'),
-])
+@pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
 def test_ubersum_4(impl):
     # x,y {b}  <--- target
     #      |
@@ -404,16 +554,52 @@ def test_ubersum_4(impl):
     a, b, c, d = 2, 3, 4, 5
     x = torch.randn(a, b)
     y = torch.randn(d, b, c)
-    actual, = impl('ab,dbc->dc', x, y, batch_dims='d')
+    actual, = impl('ab,dbc->dc', x, y, plates='d', modulo_total=True)
     x_b1 = logsumexp(x, 0).unsqueeze(-1)
     assert x_b1.shape == (b, 1)
     y_db1 = logsumexp(y, 2, keepdim=True)
     assert y_db1.shape == (d, b, 1)
-    y_dbc = y_db1.sum(0) - y_db1 + y  # avoid double counting
+    y_dbc = y_db1.sum(0) - y_db1 + y  # inclusion-exclusion
     assert y_dbc.shape == (d, b, c)
     xy_dc = logsumexp(x_b1 + y_dbc, 1)
     assert xy_dc.shape == (d, c)
     expected = xy_dc
+    assert_equal(actual, expected)
+
+
+@pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
+def test_ubersum_5(impl):
+    # z {ij}  <--- target
+    #     |
+    #  y {i}
+    #     |
+    #  x {}
+    i, j, a, b, c = 2, 3, 6, 5, 4
+    x = torch.randn(a)
+    y = torch.randn(a, b, i)
+    z = torch.randn(b, c, i, j)
+    actual, = impl('a,abi,bcij->cij', x, y, z, plates='ij', modulo_total=True)
+
+    # contract plate j
+    s1 = logsumexp(z, 1)
+    assert s1.shape == (b, i, j)
+    p1 = s1.sum(2)
+    assert p1.shape == (b, i)
+    q1 = z - s1.unsqueeze(-3)
+    assert q1.shape == (b, c, i, j)
+
+    # contract plate i
+    x2 = y + p1
+    assert x2.shape == (a, b, i)
+    s2 = logsumexp(x2, 1)
+    assert s2.shape == (a, i)
+    p2 = s2.sum(1)
+    assert p2.shape == (a,)
+    q2 = x2 - s2.unsqueeze(-2)
+    assert q2.shape == (a, b, i)
+
+    expected = opt_einsum.contract('a,a,abi,bcij->cij', x, p2, q2, q1,
+                                   backend='pyro.ops.einsum.torch_log')
     assert_equal(actual, expected)
 
 
@@ -433,7 +619,7 @@ def test_ubersum_collide_implemented(impl, implemented):
     z = torch.randn(a, b, c, d)
     raises = pytest.raises(NotImplementedError, match='Expected tree-structured plate nesting')
     with optional(raises, not implemented):
-        impl('ac,bd,abcd->', x, y, z, batch_dims='ab')
+        impl('ac,bd,abcd->', x, y, z, plates='ab', modulo_total=True)
 
 
 @pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
@@ -451,7 +637,7 @@ def test_ubersum_collide_ok_1(impl):
     y = torch.randn(b, d)
     z1 = torch.randn(a, b, c)
     z2 = torch.randn(a, b, d)
-    impl('ac,bd,abc,abd->', x, y, z1, z2, batch_dims='ab')
+    impl('ac,bd,abc,abd->', x, y, z1, z2, plates='ab', modulo_total=True)
 
 
 @pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
@@ -470,7 +656,7 @@ def test_ubersum_collide_ok_2(impl):
     y = torch.randn(b, d)
     z1 = torch.randn(a, b, c)
     z2 = torch.randn(a, b, d)
-    impl('cd,ac,bd,abc,abd->', w, x, y, z1, z2, batch_dims='ab')
+    impl('cd,ac,bd,abc,abd->', w, x, y, z1, z2, plates='ab', modulo_total=True)
 
 
 @pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
@@ -487,7 +673,7 @@ def test_ubersum_collide_ok_3(impl):
     x = torch.randn(a, c)
     y = torch.randn(b, c)
     z = torch.randn(a, b, c)
-    impl('c,ac,bc,abc->', w, x, y, z, batch_dims='ab')
+    impl('c,ac,bc,abc->', w, x, y, z, plates='ab', modulo_total=True)
 
 
 UBERSUM_SHAPE_ERRORS = [
@@ -496,32 +682,97 @@ UBERSUM_SHAPE_ERRORS = [
 ]
 
 
-@pytest.mark.parametrize('equation,shapes,batch_dims', UBERSUM_SHAPE_ERRORS)
+@pytest.mark.parametrize('equation,shapes,plates', UBERSUM_SHAPE_ERRORS)
 @pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
-def test_ubersum_size_error(impl, equation, shapes, batch_dims):
+def test_ubersum_size_error(impl, equation, shapes, plates):
     operands = [torch.randn(shape) for shape in shapes]
     with pytest.raises(ValueError, match='Dimension size mismatch|Size of label'):
-        impl(equation, *operands, batch_dims=batch_dims)
+        impl(equation, *operands, plates=plates, modulo_total=True)
 
 
 UBERSUM_BATCH_ERRORS = [
-    ('ab->b', 'a'),
-    (',ab->b', 'a'),
-    ('ac,abc->c', 'a'),
-    (',ac,abc->c', 'a'),
-    ('abc->ac', 'ab'),
-    ('abc->bc', 'ab'),
+    ('ai->a', 'i'),
+    (',ai->a', 'i'),
+    ('bi,abi->b', 'i'),
+    (',bi,abi->b', 'i'),
+    ('aij->ai', 'ij'),
+    ('aij->aj', 'ij'),
 ]
 
 
-@pytest.mark.parametrize('equation,batch_dims', UBERSUM_BATCH_ERRORS)
-@pytest.mark.parametrize('impl', [
-    naive_ubersum,
-    xfail_param(ubersum, reason='does not detect senseless batch output'),
-])
-def test_ubersum_batch_error(impl, equation, batch_dims):
+@pytest.mark.parametrize('equation,plates', UBERSUM_BATCH_ERRORS)
+@pytest.mark.parametrize('impl', [naive_ubersum, ubersum])
+def test_ubersum_plate_error(impl, equation, plates):
     inputs, outputs = equation.split('->')
     operands = [torch.randn(torch.Size((2,) * len(input_)))
                 for input_ in inputs.split(',')]
-    with pytest.raises(ValueError, match='It is nonsensical to preserve a batched dim'):
-        impl(equation, *operands, batch_dims=batch_dims)
+    with pytest.raises(ValueError, match='It is nonsensical to preserve a plated dim'):
+        impl(equation, *operands, plates=plates, modulo_total=True)
+
+
+ADJOINT_EXAMPLES = [
+    ('a->', ''),
+    ('a,a->', ''),
+    ('ab,bc->', ''),
+    ('a,abi->', 'i'),
+    ('a,abi,bcij->', 'ij'),
+    ('a,abi,bcij,bdik->', 'ijk'),
+    ('ai,ai->i', 'i'),
+    ('ai,abij->i', 'ij'),
+    ('ai,abij,acik->i', 'ijk'),
+]
+
+
+@pytest.mark.parametrize('equation,plates', ADJOINT_EXAMPLES)
+@pytest.mark.parametrize('backend', ['map', 'sample', 'marginal'])
+def test_adjoint_shape(backend, equation, plates):
+    backend = 'pyro.ops.einsum.torch_{}'.format(backend)
+    inputs, output = equation.split('->')
+    inputs = inputs.split(',')
+    operands = [torch.randn(torch.Size((2,) * len(input_)))
+                for input_ in inputs]
+    for input_, x in zip(inputs, operands):
+        x._pyro_dims = input_
+
+    # run forward-backward algorithm
+    for x in operands:
+        require_backward(x)
+    result, = ubersum(equation, *operands, plates=plates,
+                      modulo_total=True, backend=backend)
+    result._pyro_backward()
+
+    for input_, x in zip(inputs, operands):
+        backward_result = x._pyro_backward_result
+        contract_dims = set(input_) - set(output) - set(plates)
+        if contract_dims:
+            assert backward_result is not None
+        else:
+            assert backward_result is None
+
+
+@pytest.mark.parametrize('equation,plates', ADJOINT_EXAMPLES)
+def test_adjoint_marginal(equation, plates):
+    inputs, output = equation.split('->')
+    inputs = inputs.split(',')
+    operands = [torch.randn(torch.Size((2,) * len(input_)))
+                for input_ in inputs]
+    for input_, x in zip(inputs, operands):
+        x._pyro_dims = input_
+
+    # check forward pass
+    for x in operands:
+        require_backward(x)
+    actual, = ubersum(equation, *operands, plates=plates, modulo_total=True,
+                      backend='pyro.ops.einsum.torch_marginal')
+    expected, = ubersum(equation, *operands, plates=plates, modulo_total=True,
+                        backend='pyro.ops.einsum.torch_log')
+    assert_equal(expected, actual)
+
+    # check backward pass
+    actual._pyro_backward()
+    for input_, operand in zip(inputs, operands):
+        marginal_equation = ','.join(inputs) + '->' + input_
+        expected, = ubersum(marginal_equation, *operands, plates=plates, modulo_total=True,
+                            backend='pyro.ops.einsum.torch_log')
+        actual = operand._pyro_backward_result
+        assert_equal(expected, actual)

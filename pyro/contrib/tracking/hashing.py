@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import heapq
 import itertools
@@ -8,7 +9,7 @@ from numbers import Number
 import torch
 
 
-class LSH(object):
+class LSH:
     """
     Implements locality-sensitive hashing for low-dimensional euclidean space.
 
@@ -82,7 +83,7 @@ class LSH(object):
         self._hash_to_key[_hash].remove(key)
 
     def nearby(self, key):
-        """
+        r"""
         Returns a set of keys which are neighbours of the point identified by ``key``.
 
 
@@ -103,7 +104,7 @@ class LSH(object):
         return result
 
 
-class ApproxSet(object):
+class ApproxSet:
     """
     Queries low-dimensional euclidean space for approximate occupancy.
 

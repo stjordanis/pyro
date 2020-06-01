@@ -1,10 +1,12 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import numbers
 from collections import namedtuple
 
 import torch
 
+from pyro.util import ignore_jit_warnings
 from .messenger import Messenger
 from .runtime import _DIM_ALLOCATOR
 
@@ -15,8 +17,9 @@ class CondIndepStackFrame(namedtuple("CondIndepStackFrame", ["name", "dim", "siz
         return self.dim is not None
 
     def _key(self):
-        size = self.size.item() if isinstance(self.size, torch.Tensor) else self.size
-        return self.name, self.dim, size, self.counter
+        with ignore_jit_warnings(["Converting a tensor to a Python number"]):
+            size = self.size.item() if isinstance(self.size, torch.Tensor) else self.size
+            return self.name, self.dim, size, self.counter
 
     def __eq__(self, other):
         return type(self) == type(other) and self._key() == other._key()
@@ -34,8 +37,8 @@ class CondIndepStackFrame(namedtuple("CondIndepStackFrame", ["name", "dim", "siz
 class IndepMessenger(Messenger):
     """
     This messenger keeps track of stack of independence information declared by
-    nested ``irange`` and ``plate`` contexts. This information is stored in
-    a ``cond_indep_stack`` at each sample/observe site for consumption by
+    nested ``plate`` contexts. This information is stored in a
+    ``cond_indep_stack`` at each sample/observe site for consumption by
     ``TraceMessenger``.
 
     Example::
@@ -51,10 +54,10 @@ class IndepMessenger(Messenger):
 
     """
     def __init__(self, name=None, size=None, dim=None, device=None):
-        if size == 0:
+        if not torch._C._get_tracing_state() and size == 0:
             raise ZeroDivisionError("size cannot be zero")
 
-        super(IndepMessenger, self).__init__()
+        super().__init__()
         self._vectorized = None
         if dim is not None:
             self._vectorized = True
@@ -79,12 +82,12 @@ class IndepMessenger(Messenger):
         if self._vectorized is True:
             self.dim = _DIM_ALLOCATOR.allocate(self.name, self.dim)
 
-        return super(IndepMessenger, self).__enter__()
+        return super().__enter__()
 
     def __exit__(self, *args):
         if self._vectorized is True:
             _DIM_ALLOCATOR.free(self.name, self.dim)
-        return super(IndepMessenger, self).__exit__(*args)
+        return super().__exit__(*args)
 
     def __iter__(self):
         if self._vectorized is True or self.dim is not None:
@@ -94,11 +97,11 @@ class IndepMessenger(Messenger):
 
         self._vectorized = False
         self.dim = None
-
-        for i in self.indices:
-            self.next_context()
-            with self:
-                yield i if isinstance(i, numbers.Number) else i.item()
+        with ignore_jit_warnings([("Iterating over a tensor", RuntimeWarning)]):
+            for i in self.indices:
+                self.next_context()
+                with self:
+                    yield i if isinstance(i, numbers.Number) else i.item()
 
     def _reset(self):
         if self._vectorized:

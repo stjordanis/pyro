@@ -1,9 +1,10 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import copy
 import warnings
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from inspect import isclass
 
 import pyro.distributions as dist
@@ -11,7 +12,7 @@ import pyro.infer as infer
 import pyro.poutine as poutine
 from pyro.params import param_with_module_name
 from pyro.poutine.plate_messenger import PlateMessenger
-from pyro.poutine.runtime import _MODULE_NAMESPACE_DIVIDER, _PYRO_PARAM_STORE, am_i_wrapped, apply_stack
+from pyro.poutine.runtime import _MODULE_NAMESPACE_DIVIDER, _PYRO_PARAM_STORE, am_i_wrapped, apply_stack, effectful
 from pyro.poutine.subsample_messenger import SubsampleMessenger
 from pyro.util import deep_getattr, set_rng_seed  # noqa: F401
 
@@ -28,6 +29,36 @@ def clear_param_store():
     Clears the ParamStore. This is especially useful if you're working in a REPL.
     """
     return _PYRO_PARAM_STORE.clear()
+
+
+_param = effectful(_PYRO_PARAM_STORE.get_param, type="param")
+
+
+def param(name, *args, **kwargs):
+    """
+    Saves the variable as a parameter in the param store.
+    To interact with the param store or write to disk,
+    see `Parameters <parameters.html>`_.
+
+    :param str name: name of parameter
+    :param init_tensor: initial tensor or lazy callable that returns a tensor.
+        For large tensors, it may be cheaper to write e.g.
+        ``lambda: torch.randn(100000)``, which will only be evaluated on the
+        initial statement.
+    :type init_tensor: torch.Tensor or callable
+    :param constraint: torch constraint, defaults to ``constraints.real``.
+    :type constraint: torch.distributions.constraints.Constraint
+    :param int event_dim: (optional) number of rightmost dimensions unrelated
+        to baching. Dimension to the left of this will be considered batch
+        dimensions; if the param statement is inside a subsampled plate, then
+        corresponding batch dimensions of the parameter will be correspondingly
+        subsampled. If unspecified, all dimensions will be considered event
+        dims and no subsampling will be performed.
+    :returns: parameter
+    :rtype: torch.Tensor
+    """
+    kwargs["name"] = name
+    return _param(name, *args, **kwargs)
 
 
 def sample(name, fn, *args, **kwargs):
@@ -50,7 +81,7 @@ def sample(name, fn, *args, **kwargs):
     # check if stack is empty
     # if stack empty, default behavior (defined here)
     if not am_i_wrapped():
-        if obs is not None:
+        if obs is not None and not infer.get("_deterministic"):
             warnings.warn("trying to observe a value outside of inference at " + name,
                           RuntimeWarning)
             return obs
@@ -83,17 +114,92 @@ def sample(name, fn, *args, **kwargs):
         return msg["value"]
 
 
+def factor(name, log_factor):
+    """
+    Factor statement to add arbitrary log probability factor to a
+    probabilisitic model.
+
+    :param str name: Name of the trivial sample
+    :param torch.Tensor log_factor: A possibly batched log probability factor.
+    """
+    unit_dist = dist.Unit(log_factor)
+    unit_value = unit_dist.sample()
+    sample(name, unit_dist, obs=unit_value)
+
+
+def deterministic(name, value, event_dim=None):
+    """
+    EXPERIMENTAL Deterministic statement to add a :class:`~pyro.distributions.Delta`
+    site with name `name` and value `value` to the trace. This is useful when
+    we want to record values which are completely determined by their parents.
+    For example::
+
+        x = sample("x", dist.Normal(0, 1))
+        x2 = deterministic("x2", x ** 2)
+
+    .. note:: The site does not affect the model density. This currently converts
+        to a :func:`sample` statement, but may change in the future.
+
+    :param str name: Name of the site.
+    :param torch.Tensor value: Value of the site.
+    :param int event_dim: Optional event dimension, defaults to `value.ndim`.
+    """
+    event_dim = value.ndim if event_dim is None else event_dim
+    return sample(name, dist.Delta(value, event_dim=event_dim).mask(False),
+                  obs=value, infer={"_deterministic": True})
+
+
+@effectful(type="subsample")
+def subsample(data, event_dim):
+    """
+    EXPERIMENTAL Subsampling statement to subsample data based on enclosing
+    :class:`~pyro.primitives.plate` s.
+
+    This is typically called on arguments to ``model()`` when subsampling is
+    performed automatically by :class:`~pyro.primitives.plate` s by passing
+    either the ``subsample`` or ``subsample_size`` kwarg. For example the
+    following are equivalent::
+
+        # Version 1. using pyro.subsample()
+        def model(data):
+            with pyro.plate("data", len(data), subsample_size=10, dim=-data.dim()) as ind:
+                data = data[ind]
+                # ...
+
+        # Version 2. using indexing
+        def model(data):
+            with pyro.plate("data", len(data), subsample_size=10, dim=-data.dim()):
+                data = pyro.subsample(data, event_dim=0)
+                # ...
+
+    :param data: A tensor of batched data.
+    :type data: ~torch.Tensor
+    :param int event_dim: The event dimension of the data tensor. Dimensions to
+        the left are considered batch dimensions.
+    :returns: A subsampled version of ``data``
+    :rtype: ~torch.Tensor
+    """
+    assert isinstance(event_dim, int) and event_dim >= 0
+    return data  # May be intercepted by SubsampleMessenger.
+
+
 class plate(PlateMessenger):
     """
-    Context manager for conditionally independent ranges of variables.
+    Construct for conditionally independent sequences of variables.
 
-    :class:`plate` is similar to :func:`torch.arange` in that it yields an
-    array of indices by which other tensors can be indexed. :class:`plate`
-    differs from :func:`torch.arange` in that it also informs inference
-    algorithms that the variables being indexed are conditionally independent.
-    To do this, :class:`plate` is a provided as context manager rather than a
-    function, and users must guarantee that all computation within an
-    :class:`plate` context is conditionally independent::
+    ``plate`` can be used either sequentially as a generator or in parallel as
+    a context manager (formerly ``irange`` and ``iarange``, respectively).
+
+    Sequential :class:`plate` is similar to :py:func:`range` in that it generates
+    a sequence of values.
+
+    Vectorized :class:`plate` is similar to :func:`torch.arange` in that it
+    yields an array of indices by which other tensors can be indexed.
+    :class:`plate` differs from :func:`torch.arange` in that it also informs
+    inference algorithms that the variables being indexed are conditionally
+    independent.  To do this, :class:`plate` is a provided as context manager
+    rather than a function, and users must guarantee that all computation
+    within an :class:`plate` context is conditionally independent::
 
         with plate("name", size) as ind:
             # ...do conditionally independent stuff with ind...
@@ -145,8 +251,14 @@ class plate(PlateMessenger):
 
            >>> loc, scale = torch.tensor(0.), torch.tensor(1.)
            >>> data = torch.randn(100)
+           >>> z = dist.Bernoulli(0.5).sample((100,))
 
-        >>> # This version simply declares independence:
+        >>> # This version declares sequential independence and subsamples data:
+        >>> for i in plate('data', 100, subsample_size=10):
+        ...     if z[i]:  # Control flow in this example prevents vectorization.
+        ...         obs = sample('obs_{}'.format(i), dist.Normal(loc, scale), obs=data[i])
+
+        >>> # This version declares vectorized independence:
         >>> with plate('data'):
         ...     obs = sample('obs', dist.Normal(loc, scale), obs=data)
 
@@ -181,78 +293,32 @@ class plate(PlateMessenger):
 class iarange(plate):
     def __init__(self, *args, **kwargs):
         warnings.warn("pyro.iarange is deprecated; use pyro.plate instead", DeprecationWarning)
-        super(iarange, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
 
 class irange(SubsampleMessenger):
+    def __init__(self, *args, **kwargs):
+        warnings.warn("pyro.irange is deprecated; use pyro.plate instead", DeprecationWarning)
+        super().__init__(*args, **kwargs)
+
+
+@contextmanager
+def plate_stack(prefix, sizes, rightmost_dim=-1):
     """
-    Non-vectorized version of :class:`plate`. See :class:`plate` for details.
+    Create a contiguous stack of :class:`plate` s with dimensions::
 
-    :param str name: A name that will be used for this site in a Trace.
-    :param int size: The size of the collection being subsampled (like ``stop``
-        in builtin :func:`range`).
-    :param int subsample_size: Size of minibatches used in subsampling.
-        Defaults to ``size``.
-    :param subsample: Optional custom subsample for user-defined subsampling
-        schemes. If specified, then ``subsample_size`` will be set to
-        ``len(subsample)``.
-    :type subsample: Anything supporting ``len()``.
-    :param bool use_cuda: DEPRECATED, use the `device` arg instead.
-        Optional bool specifying whether to use cuda tensors for `subsample`
-        and `log_prob`. Defaults to ``torch.Tensor.is_cuda``.
-    :param str device: Optional keyword specifying which device to place
-        the results of `subsample` and `log_prob` on. By default, results
-        are placed on the same device as the default tensor.
-    :return: A reusable iterator yielding a sequence of integers.
+        rightmost_dim - len(sizes), ..., rightmost_dim
 
-    Examples:
-
-        .. doctest::
-           :hide:
-
-           >>> loc, scale = torch.tensor(0.), torch.tensor(1.)
-           >>> data = torch.randn(100)
-           >>> z = dist.Bernoulli(0.5).sample((100,))
-
-        >>> for i in irange('data', 100, subsample_size=10):
-        ...     if z[i]:  # Prevents vectorization.
-        ...         obs = sample('obs_{}'.format(i), dist.Normal(loc, scale), obs=data[i])
-
-    See `SVI Part II <http://pyro.ai/examples/svi_part_ii.html>`_ for an extended discussion.
+    :param str prefix: Name prefix for plates.
+    :param iterable sizes: An iterable of plate sizes.
+    :param int rightmost_dim: The rightmost dim, counting from the right.
     """
-    pass
-
-
-# XXX this should have the same call signature as torch.Tensor constructors
-def param(name, *args, **kwargs):
-    """
-    Saves the variable as a parameter in the param store.
-    To interact with the param store or write to disk,
-    see `Parameters <parameters.html>`_.
-
-    :param name: name of parameter
-    :returns: parameter
-    """
-    if not am_i_wrapped():
-        return _PYRO_PARAM_STORE.get_param(name, *args, **kwargs)
-    else:
-        msg = {
-            "type": "param",
-            "name": name,
-            "args": args,
-            "kwargs": kwargs,
-            "infer": {},
-            "scale": 1.0,
-            "mask": None,
-            "cond_indep_stack": (),
-            "value": None,
-            "done": False,
-            "stop": False,
-            "continuation": None
-        }
-        # apply the stack and return its return value
-        apply_stack(msg)
-        return msg["value"]
+    assert rightmost_dim < 0
+    with ExitStack() as stack:
+        for i, size in enumerate(reversed(sizes)):
+            plate_i = plate("{}_{}".format(prefix, i), size, dim=rightmost_dim - i)
+            stack.enter_context(plate_i)
+        yield
 
 
 def module(name, nn_module, update_module_params=False):
@@ -282,13 +348,17 @@ def module(name, nn_module, update_module_params=False):
     target_state_dict = OrderedDict()
 
     for param_name, param_value in nn_module.named_parameters():
-        # register the parameter in the module with pyro
-        # this only does something substantive if the parameter hasn't been seen before
-        full_param_name = param_with_module_name(name, param_name)
-        returned_param = param(full_param_name, param_value)
+        if param_value.requires_grad:
+            # register the parameter in the module with pyro
+            # this only does something substantive if the parameter hasn't been seen before
+            full_param_name = param_with_module_name(name, param_name)
+            returned_param = param(full_param_name, param_value)
 
-        if param_value._cdata != returned_param._cdata:
-            target_state_dict[param_name] = returned_param
+            if param_value._cdata != returned_param._cdata:
+                target_state_dict[param_name] = returned_param
+        else:
+            warnings.warn("{} was not registered in the param store because".format(param_name) +
+                          " requires_grad=False")
 
     if target_state_dict and update_module_params:
         # WARNING: this is very dangerous. better method?
@@ -310,13 +380,18 @@ def module(name, nn_module, update_module_params=False):
 
 
 def random_module(name, nn_module, prior, *args, **kwargs):
-    """
-    Places a prior over the parameters of the module `nn_module`.
-    Returns a distribution (callable) over `nn.Module`s, which
-    upon calling returns a sampled `nn.Module`.
+    r"""
+    .. warning::
+        The `random_module` primitive is deprecated, and will be removed
+        in a future release. Use :class:`~pyro.nn.module.PyroModule` instead to
+        to create Bayesian modules from :class:`torch.nn.Module` instances.
+        See the `Bayesian Regression tutorial <http://pyro.ai/examples/bayesian_regression.html>`_
+        for an example.
 
-    See the `Bayesian Regression tutorial <http://pyro.ai/examples/bayesian_regression.html>`_
-    for an example.
+
+    Places a prior over the parameters of the module `nn_module`.
+    Returns a distribution (callable) over `nn.Module`\s, which
+    upon calling returns a sampled `nn.Module`.
 
     :param name: name of pyro module
     :type name: str
@@ -326,6 +401,10 @@ def random_module(name, nn_module, prior, *args, **kwargs):
                   as keys and respective distributions/stochastic functions as values.
     :returns: a callable which returns a sampled module
     """
+    warnings.warn("The `random_module` primitive is deprecated, and will be removed "
+                  "in a future release. Use `pyro.nn.Module` to create Bayesian "
+                  "modules from `torch.nn.Module` instances.", FutureWarning)
+
     assert hasattr(nn_module, "parameters"), "Module is not a NN module."
     # register params in param store
     lifted_fn = poutine.lift(module, prior=prior)

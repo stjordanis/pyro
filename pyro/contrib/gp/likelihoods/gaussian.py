@@ -1,13 +1,14 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 from torch.distributions import constraints
-from torch.nn import Parameter
 
 import pyro
 import pyro.distributions as dist
 
-from .likelihood import Likelihood
+from pyro.contrib.gp.likelihoods.likelihood import Likelihood
+from pyro.nn.module import PyroParam
 
 
 class Gaussian(Likelihood):
@@ -19,15 +20,14 @@ class Gaussian(Likelihood):
     :param torch.Tensor variance: A variance parameter, which plays the role of
         ``noise`` in regression problems.
     """
-    def __init__(self, variance=None, name="Gaussian"):
-        super(Gaussian, self).__init__(name)
-        if variance is None:
-            variance = torch.tensor(1.)
-        self.variance = Parameter(variance)
-        self.set_constraint("variance", constraints.positive)
+    def __init__(self, variance=None):
+        super().__init__()
+
+        variance = torch.tensor(1.) if variance is None else variance
+        self.variance = PyroParam(variance, constraints.positive)
 
     def forward(self, f_loc, f_var, y=None):
-        """
+        r"""
         Samples :math:`y` given :math:`f_{loc}`, :math:`f_{var}` according to
 
             .. math:: y \sim \mathbb{Normal}(f_{loc}, f_{var} + \epsilon),
@@ -40,10 +40,9 @@ class Gaussian(Likelihood):
         :returns: a tensor sampled from likelihood
         :rtype: torch.Tensor
         """
-        variance = self.get_param("variance")
-        y_var = f_var + variance
+        y_var = f_var + self.variance
 
-        y_dist = dist.Normal(f_loc, y_var)
+        y_dist = dist.Normal(f_loc, y_var.sqrt())
         if y is not None:
-            y_dist = y_dist.expand_by(y.shape[:-f_loc.dim()]).independent(y.dim())
-        return pyro.sample(self.y_name, y_dist, obs=y)
+            y_dist = y_dist.expand_by(y.shape[:-f_loc.dim()]).to_event(y.dim())
+        return pyro.sample(self._pyro_get_fullname("y"), y_dist, obs=y)

@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import logging
 import os
@@ -9,15 +10,29 @@ import torch
 
 import pyro
 import pyro.distributions as dist
-from pyro.infer import EmpiricalMarginal
+from pyro.infer.mcmc import NUTS
 from pyro.infer.mcmc.hmc import HMC
-from pyro.infer.mcmc.mcmc import MCMC
-from tests.common import assert_equal
+from pyro.infer.mcmc.api import MCMC
+from tests.common import assert_equal, assert_close
 
 logger = logging.getLogger(__name__)
 
 
-class GaussianChain(object):
+def mark_jit(*args, **kwargs):
+    jit_markers = kwargs.pop("marks", [])
+    jit_markers += [
+        pytest.mark.skipif('CI' in os.environ,
+                           reason='to reduce running time on CI')
+    ]
+    kwargs["marks"] = jit_markers
+    return pytest.param(*args, **kwargs)
+
+
+def jit_idfn(param):
+    return "JIT={}".format(param)
+
+
+class GaussianChain:
 
     def __init__(self, dim, chain_len, num_obs):
         self.dim = dim
@@ -65,48 +80,41 @@ TEST_CASES = [
                     'num_steps': 4},
         expected_means=[0.25, 0.50, 0.75],
         expected_precs=[1.33, 1, 1.33],
-        mean_tol=0.06,
+        mean_tol=0.08,
         std_tol=0.08,
     ),
     T(
         GaussianChain(dim=10, chain_len=4, num_obs=1),
-        num_samples=1200,
+        num_samples=1600,
         warmup_steps=300,
         hmc_params={'step_size': 0.46,
                     'num_steps': 5},
         expected_means=[0.20, 0.40, 0.60, 0.80],
         expected_precs=[1.25, 0.83, 0.83, 1.25],
-        mean_tol=0.06,
-        std_tol=0.06,
+        mean_tol=0.08,
+        std_tol=0.08,
     ),
-    # XXX: Very sensitive to HMC parameters. Biased estimate is obtained
-    # without enough samples and/or larger step size.
-    pytest.param(*T(
-        GaussianChain(dim=5, chain_len=2, num_obs=10000),
+    T(
+        GaussianChain(dim=5, chain_len=2, num_obs=100),
         num_samples=2000,
-        warmup_steps=500,
-        hmc_params={'step_size': 0.013,
-                    'num_steps': 25},
+        warmup_steps=1000,
+        hmc_params={'num_steps': 15, 'step_size': 0.7},
         expected_means=[0.5, 1.0],
-        expected_precs=[2.0, 10000],
-        mean_tol=0.05,
-        std_tol=0.05,
-    ), marks=[pytest.mark.xfail(reason="flaky"),
-              pytest.mark.skipif('CI' in os.environ or 'CUDA_TEST' in os.environ,
-                                 reason='Slow test - skip on CI/CUDA')]),
-    pytest.param(*T(
+        expected_precs=[2.0, 100],
+        mean_tol=0.08,
+        std_tol=0.08,
+    ),
+    T(
         GaussianChain(dim=5, chain_len=9, num_obs=1),
         num_samples=3000,
         warmup_steps=500,
-        hmc_params={'step_size': 0.3,
-                    'num_steps': 8},
+        hmc_params={'step_size': 0.2,
+                    'num_steps': 15},
         expected_means=[0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90],
         expected_precs=[1.11, 0.63, 0.48, 0.42, 0.4, 0.42, 0.48, 0.63, 1.11],
-        mean_tol=0.08,
-        std_tol=0.08,
-    ), marks=[pytest.mark.xfail(reason="flaky"),
-              pytest.mark.skipif('CI' in os.environ or 'CUDA_TEST' in os.environ,
-                                 reason='Slow test - skip on CI/CUDA')])
+        mean_tol=0.11,
+        std_tol=0.11,
+    )
 ]
 
 TEST_IDS = [t[0].id_fn() if type(t).__name__ == 'TestExample'
@@ -117,7 +125,7 @@ TEST_IDS = [t[0].id_fn() if type(t).__name__ == 'TestExample'
     'fixture, num_samples, warmup_steps, hmc_params, expected_means, expected_precs, mean_tol, std_tol',
     TEST_CASES,
     ids=TEST_IDS)
-@pytest.mark.init(rng_seed=34)
+@pytest.mark.skip(reason='Slow test (https://github.com/pytorch/pytorch/issues/12190)')
 @pytest.mark.disable_validation()
 def test_hmc_conjugate_gaussian(fixture,
                                 num_samples,
@@ -128,30 +136,28 @@ def test_hmc_conjugate_gaussian(fixture,
                                 mean_tol,
                                 std_tol):
     pyro.get_param_store().clear()
-    hmc_params["adapt_step_size"] = False
-    hmc_params["adapt_mass_matrix"] = False
     hmc_kernel = HMC(fixture.model, **hmc_params)
-    mcmc_run = MCMC(hmc_kernel, num_samples, warmup_steps).run(fixture.data)
+    samples = MCMC(hmc_kernel, num_samples, warmup_steps).run(fixture.data)
     for i in range(1, fixture.chain_len + 1):
         param_name = 'loc_' + str(i)
-        marginal = EmpiricalMarginal(mcmc_run, sites=param_name)
-        latent_loc = marginal.mean
-        latent_std = marginal.variance.sqrt()
+        marginal = samples[param_name]
+        latent_loc = marginal.mean(0)
+        latent_std = marginal.var(0).sqrt()
         expected_mean = torch.ones(fixture.dim) * expected_means[i - 1]
         expected_std = 1 / torch.sqrt(torch.ones(fixture.dim) * expected_precs[i - 1])
 
         # Actual vs expected posterior means for the latents
-        logger.info('Posterior mean (actual) - {}'.format(param_name))
-        logger.info(latent_loc)
-        logger.info('Posterior mean (expected) - {}'.format(param_name))
-        logger.info(expected_mean)
+        logger.debug('Posterior mean (actual) - {}'.format(param_name))
+        logger.debug(latent_loc)
+        logger.debug('Posterior mean (expected) - {}'.format(param_name))
+        logger.debug(expected_mean)
         assert_equal(rmse(latent_loc, expected_mean).item(), 0.0, prec=mean_tol)
 
         # Actual vs expected posterior precisions for the latents
-        logger.info('Posterior std (actual) - {}'.format(param_name))
-        logger.info(latent_std)
-        logger.info('Posterior std (expected) - {}'.format(param_name))
-        logger.info(expected_std)
+        logger.debug('Posterior std (actual) - {}'.format(param_name))
+        logger.debug(latent_std)
+        logger.debug('Posterior std (expected) - {}'.format(param_name))
+        logger.debug(expected_std)
         assert_equal(rmse(latent_std, expected_std).item(), 0.0, prec=std_tol)
 
 
@@ -173,33 +179,55 @@ def test_logistic_regression(step_size, trajectory_length, num_steps,
     labels = dist.Bernoulli(logits=(true_coefs * data).sum(-1)).sample()
 
     def model(data):
-        coefs_mean = torch.zeros(dim)
+        coefs_mean = pyro.param('coefs_mean', torch.zeros(dim))
         coefs = pyro.sample('beta', dist.Normal(coefs_mean, torch.ones(dim)))
         y = pyro.sample('y', dist.Bernoulli(logits=(coefs * data).sum(-1)), obs=labels)
         return y
 
-    hmc_kernel = HMC(model, step_size, trajectory_length, num_steps,
-                     adapt_step_size, adapt_mass_matrix, full_mass)
-    mcmc_run = MCMC(hmc_kernel, num_samples=500, warmup_steps=100).run(data)
-    beta_posterior = EmpiricalMarginal(mcmc_run, sites='beta')
-    assert_equal(rmse(true_coefs, beta_posterior.mean).item(), 0.0, prec=0.1)
+    hmc_kernel = HMC(model, step_size=step_size, trajectory_length=trajectory_length,
+                     num_steps=num_steps, adapt_step_size=adapt_step_size,
+                     adapt_mass_matrix=adapt_mass_matrix, full_mass=full_mass)
+    mcmc = MCMC(hmc_kernel, num_samples=500, warmup_steps=100, disable_progbar=True)
+    mcmc.run(data)
+    samples = mcmc.get_samples()['beta']
+    assert_equal(rmse(true_coefs, samples.mean(0)).item(), 0.0, prec=0.1)
 
 
-def test_beta_bernoulli():
+@pytest.mark.parametrize("jit", [False, mark_jit(True)], ids=jit_idfn)
+def test_dirichlet_categorical(jit):
     def model(data):
-        # wrapped by `pyro.param` to test if it works
-        alpha = pyro.param('alpha', torch.tensor([1.1, 1.1]))
-        beta = pyro.param('beta', torch.tensor([1.1, 1.1]))
+        concentration = torch.tensor([1.0, 1.0, 1.0])
+        p_latent = pyro.sample('p_latent', dist.Dirichlet(concentration))
+        pyro.sample("obs", dist.Categorical(p_latent), obs=data)
+        return p_latent
+
+    true_probs = torch.tensor([0.1, 0.6, 0.3])
+    data = dist.Categorical(true_probs).sample(sample_shape=(torch.Size((2000,))))
+    hmc_kernel = HMC(model, trajectory_length=1, jit_compile=jit, ignore_jit_warnings=True)
+    mcmc = MCMC(hmc_kernel, num_samples=200, warmup_steps=100)
+    mcmc.run(data)
+    samples = mcmc.get_samples()
+    assert_equal(samples['p_latent'].mean(0), true_probs, prec=0.02)
+
+
+@pytest.mark.parametrize("jit", [False, mark_jit(True)], ids=jit_idfn)
+def test_beta_bernoulli(jit):
+    def model(data):
+        alpha = torch.tensor([1.1, 1.1])
+        beta = torch.tensor([1.1, 1.1])
         p_latent = pyro.sample('p_latent', dist.Beta(alpha, beta))
-        pyro.sample('obs', dist.Bernoulli(p_latent), obs=data)
+        with pyro.plate("data", data.shape[0], dim=-2):
+            pyro.sample('obs', dist.Bernoulli(p_latent), obs=data)
         return p_latent
 
     true_probs = torch.tensor([0.9, 0.1])
     data = dist.Bernoulli(true_probs).sample(sample_shape=(torch.Size((1000,))))
-    hmc_kernel = HMC(model, trajectory_length=1)
-    mcmc_run = MCMC(hmc_kernel, num_samples=800, warmup_steps=500).run(data)
-    posterior = EmpiricalMarginal(mcmc_run, sites='p_latent')
-    assert_equal(posterior.mean, true_probs, prec=0.05)
+    hmc_kernel = HMC(model, trajectory_length=1, max_plate_nesting=2,
+                     jit_compile=jit, ignore_jit_warnings=True)
+    mcmc = MCMC(hmc_kernel, num_samples=800, warmup_steps=500)
+    mcmc.run(data)
+    samples = mcmc.get_samples()
+    assert_equal(samples['p_latent'].mean(0), true_probs, prec=0.05)
 
 
 def test_gamma_normal():
@@ -212,52 +240,15 @@ def test_gamma_normal():
 
     true_std = torch.tensor([0.5, 2])
     data = dist.Normal(3, true_std).sample(sample_shape=(torch.Size((2000,))))
-    hmc_kernel = HMC(model, trajectory_length=1)
-    mcmc_run = MCMC(hmc_kernel, num_samples=500, warmup_steps=100).run(data)
-    posterior = EmpiricalMarginal(mcmc_run, sites='p_latent')
-    assert_equal(posterior.mean, true_std, prec=0.05)
+    hmc_kernel = HMC(model, num_steps=15, step_size=0.01, adapt_step_size=True)
+    mcmc = MCMC(hmc_kernel, num_samples=200, warmup_steps=200)
+    mcmc.run(data)
+    samples = mcmc.get_samples()
+    assert_equal(samples['p_latent'].mean(0), true_std, prec=0.05)
 
 
-def test_dirichlet_categorical():
-    def model(data):
-        concentration = torch.tensor([1.0, 1.0, 1.0])
-        p_latent = pyro.sample('p_latent', dist.Dirichlet(concentration))
-        pyro.sample("obs", dist.Categorical(p_latent), obs=data)
-        return p_latent
-
-    true_probs = torch.tensor([0.1, 0.6, 0.3])
-    data = dist.Categorical(true_probs).sample(sample_shape=(torch.Size((2000,))))
-    hmc_kernel = HMC(model, trajectory_length=1)
-    mcmc_run = MCMC(hmc_kernel, num_samples=200, warmup_steps=100).run(data)
-    posterior = EmpiricalMarginal(mcmc_run, sites='p_latent')
-    assert_equal(posterior.mean, true_probs, prec=0.02)
-
-
-def test_gaussian_mixture_model():
-    K, N = 3, 1000
-
-    def gmm(data):
-        mix_proportions = pyro.sample("phi", dist.Dirichlet(torch.ones(K)))
-        with pyro.plate("num_clusters", K):
-            cluster_means = pyro.sample("cluster_means", dist.Normal(torch.arange(float(K)), 1.))
-        with pyro.plate("data", data.shape[0]):
-            assignments = pyro.sample("assignments", dist.Categorical(mix_proportions))
-            pyro.sample("obs", dist.Normal(cluster_means[assignments], 1.), obs=data)
-        return cluster_means
-
-    true_cluster_means = torch.tensor([1., 5., 10.])
-    true_mix_proportions = torch.tensor([0.1, 0.3, 0.6])
-    cluster_assignments = dist.Categorical(true_mix_proportions).sample(torch.Size((N,)))
-    data = dist.Normal(true_cluster_means[cluster_assignments], 1.0).sample()
-    hmc_kernel = HMC(gmm, trajectory_length=1, max_plate_nesting=1)
-    mcmc_run = MCMC(hmc_kernel, num_samples=300, warmup_steps=100).run(data)
-    posterior = EmpiricalMarginal(mcmc_run, sites=["phi", "cluster_means"]).mean.sort()[0]
-    assert_equal(posterior[0], true_mix_proportions, prec=0.05)
-    assert_equal(posterior[1], true_cluster_means, prec=0.2)
-
-
-@pytest.mark.parametrize("use_einsum", [False, True])
-def test_bernoulli_latent_model(use_einsum):
+@pytest.mark.parametrize("jit", [False, mark_jit(True)], ids=jit_idfn)
+def test_bernoulli_latent_model(jit):
     def model(data):
         y_prob = pyro.sample("y_prob", dist.Beta(1.0, 1.0))
         y = pyro.sample("y", dist.Bernoulli(y_prob))
@@ -272,7 +263,60 @@ def test_bernoulli_latent_model(use_einsum):
     z = dist.Bernoulli(0.65 * y + 0.1).sample()
     data = dist.Normal(2. * z, 1.0).sample()
     hmc_kernel = HMC(model, trajectory_length=1, max_plate_nesting=1,
-                     experimental_use_einsum=use_einsum)
-    mcmc_run = MCMC(hmc_kernel, num_samples=600, warmup_steps=200).run(data)
-    posterior = EmpiricalMarginal(mcmc_run, sites="y_prob").mean
-    assert_equal(posterior, y_prob, prec=0.05)
+                     jit_compile=jit, ignore_jit_warnings=True)
+    mcmc = MCMC(hmc_kernel, num_samples=600, warmup_steps=200)
+    mcmc.run(data)
+    samples = mcmc.get_samples()
+    assert_equal(samples['y_prob'].mean(0), y_prob, prec=0.06)
+
+
+@pytest.mark.parametrize("kernel", [HMC, NUTS])
+@pytest.mark.parametrize("jit", [False, mark_jit(True)], ids=jit_idfn)
+@pytest.mark.skipif("CUDA_TEST" in os.environ, reason="https://github.com/pytorch/pytorch/issues/22811")
+def test_unnormalized_normal(kernel, jit):
+    true_mean, true_std = torch.tensor(5.), torch.tensor(1.)
+    init_params = {"z": torch.tensor(0.)}
+
+    def potential_energy(params):
+        return 0.5 * torch.sum(((params["z"] - true_mean) / true_std) ** 2)
+
+    potential_fn = potential_energy if not jit else torch.jit.trace(potential_energy, init_params)
+    hmc_kernel = kernel(model=None, potential_fn=potential_fn)
+
+    samples = init_params
+    warmup_steps = 400
+    hmc_kernel.initial_params = samples
+    hmc_kernel.setup(warmup_steps)
+
+    for i in range(warmup_steps):
+        samples = hmc_kernel(samples)
+
+    posterior = []
+    for i in range(2000):
+        hmc_kernel.clear_cache()
+        samples = hmc_kernel(samples)
+        posterior.append(samples)
+
+    posterior = torch.stack([sample["z"] for sample in posterior])
+    assert_close(torch.mean(posterior), true_mean, rtol=0.05)
+    assert_close(torch.std(posterior), true_std, rtol=0.05)
+
+
+@pytest.mark.parametrize('jit', [False, mark_jit(True)], ids=jit_idfn)
+@pytest.mark.parametrize('op', [torch.inverse, torch.cholesky])
+def test_singular_matrix_catch(jit, op):
+    def potential_energy(z):
+        return op(z['cov']).sum()
+
+    init_params = {'cov': torch.eye(3)}
+    potential_fn = potential_energy if not jit else torch.jit.trace(potential_energy, init_params)
+    hmc_kernel = HMC(potential_fn=potential_fn, adapt_step_size=False,
+                     num_steps=10, step_size=1e-20)
+    hmc_kernel.initial_params = init_params
+    hmc_kernel.setup(warmup_steps=0)
+    # setup an invalid cache to trigger singular error for torch.inverse
+    hmc_kernel._cache({'cov': torch.ones(3, 3)}, torch.tensor(0.), {'cov': torch.zeros(3, 3)})
+
+    samples = init_params
+    for i in range(10):
+        samples = hmc_kernel.sample(samples)

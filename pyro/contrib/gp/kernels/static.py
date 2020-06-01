@@ -1,58 +1,53 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 from torch.distributions import constraints
-from torch.nn import Parameter
 
-from .kernel import Kernel
+from pyro.contrib.gp.kernels.kernel import Kernel
+from pyro.nn.module import PyroParam
 
 
 class Constant(Kernel):
-    """
+    r"""
     Implementation of Constant kernel:
 
         :math:`k(x, z) = \sigma^2.`
     """
-    def __init__(self, input_dim, variance=None, active_dims=None, name="Constant"):
-        super(Constant, self).__init__(input_dim, active_dims, name)
+    def __init__(self, input_dim, variance=None, active_dims=None):
+        super().__init__(input_dim, active_dims)
 
-        if variance is None:
-            variance = torch.tensor(1.)
-        self.variance = Parameter(variance)
-        self.set_constraint("variance", constraints.positive)
+        variance = torch.tensor(1.) if variance is None else variance
+        self.variance = PyroParam(variance, constraints.positive)
 
     def forward(self, X, Z=None, diag=False):
-        variance = self.get_param("variance")
         if diag:
-            return variance.expand(X.shape[0])
+            return self.variance.expand(X.size(0))
 
         if Z is None:
             Z = X
-        return variance.expand(X.shape[0], Z.shape[0])
+        return self.variance.expand(X.size(0), Z.size(0))
 
 
 class WhiteNoise(Kernel):
-    """
+    r"""
     Implementation of WhiteNoise kernel:
 
         :math:`k(x, z) = \sigma^2 \delta(x, z),`
 
     where :math:`\delta` is a Dirac delta function.
     """
-    def __init__(self, input_dim, variance=None, active_dims=None, name="WhiteNoise"):
-        super(WhiteNoise, self).__init__(input_dim, active_dims, name)
+    def __init__(self, input_dim, variance=None, active_dims=None):
+        super().__init__(input_dim, active_dims)
 
-        if variance is None:
-            variance = torch.tensor(1.)
-        self.variance = Parameter(variance)
-        self.set_constraint("variance", constraints.positive)
+        variance = torch.tensor(1.) if variance is None else variance
+        self.variance = PyroParam(variance, constraints.positive)
 
     def forward(self, X, Z=None, diag=False):
-        variance = self.get_param("variance")
         if diag:
-            return variance.expand(X.shape[0])
+            return self.variance.expand(X.size(0))
 
         if Z is None:
-            return variance.expand(X.shape[0]).diag()
+            return self.variance.expand(X.size(0)).diag()
         else:
-            return X.data.new_zeros(X.shape[0], Z.shape[0])
+            return X.data.new_zeros(X.size(0), Z.size(0))

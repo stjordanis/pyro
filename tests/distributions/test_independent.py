@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import pytest
 import torch
@@ -40,13 +41,57 @@ def test_independent(base_dist, sample_shape, batch_shape, reinterpreted_batch_n
         assert_equal(log_prob, _sum_rightmost(log_prob_0, reinterpreted_batch_ndims))
 
 
+@pytest.mark.parametrize('base_dist',
+                         [dist.Normal(1., 2.), dist.Exponential(2.),
+                          dist.MultivariateNormal(torch.zeros(2), torch.eye(2))],
+                         ids=['normal', 'exponential', 'mvn'])
+def test_to_event(base_dist):
+    base_dist = base_dist.expand([2, 3])
+    d = base_dist
+    expected_event_dim = d.event_dim
+
+    d = d.to_event(0)
+    assert d is base_dist
+
+    d = d.to_event(1)
+    expected_event_dim += 1
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(0)
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(1)
+    expected_event_dim += 1
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(0)
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(-1)
+    expected_event_dim += -1
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(0)
+    assert d.event_dim == expected_event_dim
+    assert d.base_dist is base_dist
+
+    d = d.to_event(-1)
+    expected_event_dim += -1
+    assert d is base_dist
+
+
 @pytest.mark.parametrize('event_shape', [(), (2,), (2, 3)])
 @pytest.mark.parametrize('batch_shape', [(), (3,), (5, 3)])
 @pytest.mark.parametrize('sample_shape', [(), (2,), (4, 2)])
 def test_expand(sample_shape, batch_shape, event_shape):
     ones_shape = torch.Size((1,) * len(batch_shape))
     zero = torch.zeros(ones_shape + event_shape)
-    d0 = dist.Uniform(zero - 2, zero + 1).independent(len(event_shape))
+    d0 = dist.Uniform(zero - 2, zero + 1).to_event(len(event_shape))
 
     assert d0.sample().shape == ones_shape + event_shape
     assert d0.mean.shape == ones_shape + event_shape
@@ -62,10 +107,11 @@ def test_expand(sample_shape, batch_shape, event_shape):
                                         torch.eye(2).expand(*(event_shape + (2, 2))))
     if len(event_shape) > len(base_dist.batch_shape):
         with pytest.raises(ValueError):
-            base_dist.independent(len(event_shape)).expand(batch_shape)
+            base_dist.to_event(len(event_shape)).expand(batch_shape)
     else:
-            expanded = base_dist.independent(len(event_shape)).expand(batch_shape)
-            assert expanded.batch_shape == batch_shape
-            assert expanded.event_shape == (base_dist.batch_shape[len(base_dist.batch_shape) -
-                                                                  expanded.reinterpreted_batch_ndims:] +
-                                            base_dist.event_shape)
+        expanded = base_dist.to_event(len(event_shape)).expand(batch_shape)
+        expanded_batch_ndims = getattr(expanded, 'reinterpreted_batch_ndims', 0)
+        assert expanded.batch_shape == batch_shape
+        assert expanded.event_shape == (base_dist.batch_shape[len(base_dist.batch_shape) -
+                                                              expanded_batch_ndims:] +
+                                        base_dist.event_shape)

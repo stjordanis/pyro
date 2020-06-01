@@ -1,7 +1,7 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
-from pyro.contrib.gp.util import Parameterized
-from pyro.params import param_with_module_name
+from pyro.contrib.gp.parameterized import Parameterized
 
 
 class Likelihood(Parameterized):
@@ -11,10 +11,8 @@ class Likelihood(Parameterized):
     Every inherited class should implement a forward pass which
     takes an input :math:`f` and returns a sample :math:`y`.
     """
-    def __init__(self, name=None):
-        super(Likelihood, self).__init__(name)
-        self.y_name = (param_with_module_name(name, "y") if name is not None
-                       else "y")
+    def __init__(self):
+        super().__init__()
 
     def forward(self, f_loc, f_var, y=None):
         """

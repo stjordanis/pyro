@@ -1,5 +1,7 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABCMeta, abstractmethod
-from six import add_metaclass
 
 import torch
 from torch import nn
@@ -8,8 +10,7 @@ import pyro.distributions as dist
 from pyro.distributions.util import eye_like
 
 
-@add_metaclass(ABCMeta)
-class DynamicModel(nn.Module):
+class DynamicModel(nn.Module, metaclass=ABCMeta):
     '''
     Dynamic model interface.
 
@@ -23,7 +24,7 @@ class DynamicModel(nn.Module):
         self._dimension = dimension
         self._dimension_pv = dimension_pv
         self._num_process_noise_parameters = num_process_noise_parameters
-        super(DynamicModel, self).__init__()
+        super().__init__()
 
     @property
     def dimension(self):
@@ -118,7 +119,7 @@ class DynamicModel(nn.Module):
         :return: :class:`~pyro.distributions.torch.MultivariateNormal`.
         '''
         Q = self.process_noise_cov(dt)
-        return dist.MultivariateNormal(Q.new_zeros(Q.shape[-1]), Q)
+        return dist.MultivariateNormal(torch.zeros(Q.shape[-1], dtype=Q.dtype, device=Q.device), Q)
 
 
 class DifferentiableDynamicModel(DynamicModel):
@@ -151,7 +152,7 @@ class Ncp(DifferentiableDynamicModel):
     '''
     def __init__(self, dimension, sv2):
         dimension_pv = 2 * dimension
-        super(Ncp, self).__init__(dimension, dimension_pv, num_process_noise_parameters=1)
+        super().__init__(dimension, dimension_pv, num_process_noise_parameters=1)
         if not isinstance(sv2, torch.Tensor):
             sv2 = torch.tensor(sv2)
         self.sv2 = Parameter(sv2)
@@ -182,7 +183,7 @@ class Ncp(DifferentiableDynamicModel):
         :return: PV state estimate mean.
         '''
         with torch.no_grad():
-            x_pv = x.new_zeros(2*self._dimension)
+            x_pv = torch.zeros(2 * self._dimension, dtype=x.dtype, device=x.device)
             x_pv[:self._dimension] = x
         return x_pv
 
@@ -197,7 +198,7 @@ class Ncp(DifferentiableDynamicModel):
         '''
         d = 2*self._dimension
         with torch.no_grad():
-            P_pv = P.new_zeros((d, d))
+            P_pv = torch.zeros(d, d, dtype=P.dtype, device=P.device)
             P_pv[:self._dimension, :self._dimension] = P
         return P_pv
 
@@ -236,7 +237,7 @@ class Ncv(DifferentiableDynamicModel):
     '''
     def __init__(self, dimension, sa2):
         dimension_pv = dimension
-        super(Ncv, self).__init__(dimension, dimension_pv, num_process_noise_parameters=1)
+        super().__init__(dimension, dimension_pv, num_process_noise_parameters=1)
         if not isinstance(sa2, torch.Tensor):
             sa2 = torch.tensor(sa2)
         self.sa2 = Parameter(sa2)
@@ -372,7 +373,7 @@ class NcvContinuous(Ncv):
                 d = self._dimension
                 dt2 = dt * dt
                 dt3 = dt2 * dt
-                Q = self.sa2.new_zeros(d, d)
+                Q = torch.zeros(d, d, dtype=self.sa2.dtype, device=self.sa2.device)
                 eye = eye_like(self.sa2, d//2)
                 Q[:d//2, :d//2] = dt3 * eye / 3.0
                 Q[:d//2, d//2:] = dt2 * eye / 2.0
@@ -445,7 +446,7 @@ class NcvDiscrete(Ncv):
                 dt2 = dt*dt
                 dt3 = dt2*dt
                 dt4 = dt2*dt2
-                Q = self.sa2.new_zeros(d, d)
+                Q = torch.zeros(d, d, dtype=self.sa2.dtype, device=self.sa2.device)
                 Q[:d//2, :d//2] = 0.25 * dt4 * eye_like(self.sa2, d//2)
                 Q[:d//2, d//2:] = 0.5 * dt3 * eye_like(self.sa2, d//2)
                 Q[d//2:, :d//2] = 0.5 * dt3 * eye_like(self.sa2, d//2)

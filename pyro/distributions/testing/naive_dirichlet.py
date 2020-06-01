@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 
@@ -15,7 +16,7 @@ class NaiveDirichlet(Dirichlet):
     have higher variance than PyTorch's ``Dirichlet`` implementation.
     """
     def __init__(self, concentration, validate_args=None):
-        super(NaiveDirichlet, self).__init__(concentration)
+        super().__init__(concentration)
         self._gamma = Gamma(concentration, torch.ones_like(concentration), validate_args=validate_args)
 
     def rsample(self, sample_shape=torch.Size()):
@@ -32,7 +33,7 @@ class NaiveBeta(Beta):
     have higher variance than PyTorch's ``Beta`` implementation.
     """
     def __init__(self, concentration1, concentration0, validate_args=None):
-        super(NaiveBeta, self).__init__(concentration1, concentration0, validate_args=validate_args)
+        super().__init__(concentration1, concentration0, validate_args=validate_args)
         alpha_beta = torch.stack([concentration1, concentration0], -1)
         self._gamma = Gamma(alpha_beta, torch.ones_like(alpha_beta))
 

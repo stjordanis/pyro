@@ -1,22 +1,26 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 import numbers
 import random
+import sys
+import timeit
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+from itertools import zip_longest
 
-import graphviz
 import torch
-from six.moves import zip_longest
 
 from pyro.poutine.util import site_is_subsample
 
 
 def set_rng_seed(rng_seed):
     """
-    Sets seeds of torch and torch.cuda (if available).
+    Sets seeds of `torch` and `torch.cuda` (if available).
+
     :param int rng_seed: The seed value.
     """
     torch.manual_seed(rng_seed)
@@ -26,6 +30,24 @@ def set_rng_seed(rng_seed):
         np.random.seed(rng_seed)
     except ImportError:
         pass
+
+
+def get_rng_state():
+    state = {'torch': torch.get_rng_state(), 'random': random.getstate()}
+    try:
+        import numpy as np
+        state['numpy'] = np.random.get_state()
+    except ImportError:
+        pass
+    return state
+
+
+def set_rng_state(state):
+    torch.set_rng_state(state['torch'])
+    random.setstate(state['random'])
+    if 'numpy' in state:
+        import numpy as np
+        np.random.set_state(state['numpy'])
 
 
 def torch_isnan(x):
@@ -42,54 +64,92 @@ def torch_isinf(x):
     A convenient function to check if a Tensor contains any +inf; also works with numbers
     """
     if isinstance(x, numbers.Number):
-        return x == float('inf') or x == -float('inf')
-    return (x == float('inf')).any() or (x == -float('inf')).any()
+        return x == math.inf or x == -math.inf
+    return (x == math.inf).any() or (x == -math.inf).any()
 
 
-def warn_if_nan(value, msg=""):
+def warn_if_nan(value, msg="", *, filename=None, lineno=None):
     """
     A convenient function to warn if a Tensor or its grad contains any nan,
     also works with numbers.
     """
+    if filename is None:
+        try:
+            frame = sys._getframe(1)
+        except ValueError:
+            filename = "sys"
+            lineno = 1
+        else:
+            filename = frame.f_code.co_filename
+            lineno = frame.f_lineno
+
     if torch.is_tensor(value) and value.requires_grad:
-        value.register_hook(lambda x: warn_if_nan(x, msg))
+        value.register_hook(lambda x: warn_if_nan(x, "backward " + msg, filename=filename, lineno=lineno))
+
     if torch_isnan(value):
-        warnings.warn("Encountered NaN{}".format((': ' if msg else '.') + msg), stacklevel=2)
+        warnings.warn_explicit("Encountered NaN{}".format(': ' + msg if msg else '.'),
+                               UserWarning, filename, lineno)
+
+    return value
 
 
-def warn_if_inf(value, msg="", allow_posinf=False, allow_neginf=False):
+def warn_if_inf(value, msg="", allow_posinf=False, allow_neginf=False, *,
+                filename=None, lineno=None):
     """
     A convenient function to warn if a Tensor or its grad contains any inf,
     also works with numbers.
     """
+    if filename is None:
+        try:
+            frame = sys._getframe(1)
+        except ValueError:
+            filename = "sys"
+            lineno = 1
+        else:
+            filename = frame.f_code.co_filename
+            lineno = frame.f_lineno
+
     if torch.is_tensor(value) and value.requires_grad:
-            value.register_hook(lambda x: warn_if_inf(x, msg, allow_posinf, allow_neginf))
-    if (not allow_posinf) and (value == float('inf') if isinstance(value, numbers.Number)
-                               else (value == float('inf')).any()):
-        warnings.warn("Encountered +inf{}".format((': ' if msg else '.') + msg), stacklevel=2)
-    if (not allow_neginf) and (value == -float('inf') if isinstance(value, numbers.Number)
-                               else (value == -float('inf')).any()):
-        warnings.warn("Encountered -inf{}".format((': ' if msg else '.') + msg), stacklevel=2)
+        value.register_hook(lambda x: warn_if_inf(x, "backward " + msg,
+                                                  allow_posinf, allow_neginf,
+                                                  filename=filename, lineno=lineno))
+
+    if (not allow_posinf) and (value == math.inf if isinstance(value, numbers.Number)
+                               else (value == math.inf).any()):
+        warnings.warn_explicit("Encountered +inf{}".format(': ' + msg if msg else '.'),
+                               UserWarning, filename, lineno)
+    if (not allow_neginf) and (value == -math.inf if isinstance(value, numbers.Number)
+                               else (value == -math.inf).any()):
+        warnings.warn_explicit("Encountered -inf{}".format(': ' + msg if msg else '.'),
+                               UserWarning, filename, lineno)
+
+    return value
 
 
 def save_visualization(trace, graph_output):
     """
-    :param pyro.poutine.Trace trace: a trace to be visualized
-    :param graph_output: the graph will be saved to graph_output.pdf
-    :type graph_output: str
-
-    Take a trace generated by poutine.trace with `graph_type='dense'` and render
-    the graph with the output saved to file.
+    (DEPRECATED) Take a trace generated by poutine.trace with `graph_type='dense'`
+    and render the graph with the output saved to file.
 
     - non-reparameterized stochastic nodes are salmon
     - reparameterized stochastic nodes are half salmon, half grey
     - observation nodes are green
+
+    :param pyro.poutine.Trace trace: a trace to be visualized
+    :param graph_output: the graph will be saved to graph_output.pdf
+    :type graph_output: str
+
 
     Example:
 
     trace = pyro.poutine.trace(model, graph_type="dense").get_trace()
     save_visualization(trace, 'output')
     """
+    warnings.warn("`save_visualization` function is deprecated and will be removed in "
+                  "a future version.")
+
+    import graphviz
+
     g = graphviz.Digraph()
 
     for label, node in trace.nodes.items():
@@ -143,7 +203,7 @@ def check_traces_match(trace1, trace2):
                 raise ValueError("Site dims disagree at site '{}': {} vs {}".format(name, shape1, shape2))
 
 
-def check_model_guide_match(model_trace, guide_trace, max_plate_nesting=float('inf')):
+def check_model_guide_match(model_trace, guide_trace, max_plate_nesting=math.inf):
     """
     :param pyro.poutine.Trace model_trace: Trace object of the model
     :param pyro.poutine.Trace guide_trace: Trace object of the guide
@@ -235,7 +295,7 @@ def check_site_shape(site, max_plate_nesting):
                 expected_shape = [None] * (-f.dim - len(expected_shape)) + expected_shape
             if expected_shape[f.dim] is not None:
                 raise ValueError('\n  '.join([
-                    'at site "{}" within plate("", dim={}), dim collision'.format(site["name"], f.name, f.dim),
+                    'at site "{}" within plate("{}", dim={}), dim collision'.format(site["name"], f.name, f.dim),
                     'Try setting dim arg in other plates.']))
             expected_shape[f.dim] = f.size
     expected_shape = [-1 if e is None else e for e in expected_shape]
@@ -258,10 +318,16 @@ def check_site_shape(site, max_plate_nesting):
                 'Expected {}, actual {}'.format(expected_shape, actual_shape),
                 'Try one of the following fixes:',
                 '- enclose the batched tensor in a with plate(...): context',
-                '- .independent(...) the distribution being sampled',
+                '- .to_event(...) the distribution being sampled',
                 '- .permute() data dimensions']))
 
-    # TODO Check parallel dimensions on the left of max_plate_nesting.
+    # Check parallel dimensions on the left of max_plate_nesting.
+    enum_dim = site["infer"].get("_enumerate_dim")
+    if enum_dim is not None:
+        if len(site["fn"].batch_shape) >= -enum_dim and site["fn"].batch_shape[enum_dim] != 1:
+            raise ValueError('\n  '.join([
+                'Enumeration dim conflict at site "{}"'.format(site["name"]),
+                'Try increasing pyro.markov history size']))
 
 
 def _are_independent(counters1, counters2):
@@ -287,19 +353,19 @@ def check_traceenum_requirements(model_trace, guide_trace):
     enumerated_sites = set(name for name, site in guide_trace.nodes.items()
                            if site["type"] == "sample" and site["infer"].get("enumerate"))
     for role, trace in [('model', model_trace), ('guide', guide_trace)]:
-        irange_counters = {}
+        plate_counters = {}  # for sequential plates only
         enumerated_contexts = defaultdict(set)
         for name, site in trace.nodes.items():
             if site["type"] != "sample":
                 continue
-            irange_counter = {f.name: f.counter for f in site["cond_indep_stack"] if not f.vectorized}
+            plate_counter = {f.name: f.counter for f in site["cond_indep_stack"] if not f.vectorized}
             context = frozenset(f for f in site["cond_indep_stack"] if f.vectorized)
 
             # Check that sites outside each independence context precede enumerated sites inside that context.
             for enumerated_context, names in enumerated_contexts.items():
                 if not (context < enumerated_context):
                     continue
-                names = sorted(n for n in names if not _are_independent(irange_counter, irange_counters[n]))
+                names = sorted(n for n in names if not _are_independent(plate_counter, plate_counters[n]))
                 if not names:
                     continue
                 diff = sorted(f.name for f in enumerated_context - context)
@@ -309,7 +375,7 @@ def check_traceenum_requirements(model_trace, guide_trace):
                     'to avoid breaking independence of plates "{}"'.format('", "'.join(diff)),
                 ]), RuntimeWarning)
 
-            irange_counters[name] = irange_counter
+            plate_counters[name] = plate_counter
             if name in enumerated_sites:
                 enumerated_contexts[context].add(name)
 
@@ -325,14 +391,72 @@ def check_if_enumerated(guide_trace):
 
 
 @contextmanager
-def optional(context_manager, condition):
+def ignore_jit_warnings(filter=None):
+    """
+    Ignore JIT tracer warnings with messages that match `filter`. If
+    `filter` is not specified all tracer warnings are ignored.
+
+    Note this only installs warning filters if executed within traced code.
+
+    :param filter: A list containing either warning message (str),
+        or tuple consisting of (warning message (str), Warning class).
+    """
+    if not torch._C._get_tracing_state():
+        yield
+        return
+
+    with warnings.catch_warnings():
+        if filter is None:
+            warnings.filterwarnings("ignore",
+                                    category=torch.jit.TracerWarning)
+        else:
+            for msg in filter:
+                category = torch.jit.TracerWarning
+                if isinstance(msg, tuple):
+                    msg, category = msg
+                warnings.filterwarnings("ignore",
+                                        category=category,
+                                        message=msg)
+        yield
+
+
+def jit_iter(tensor):
+    """
+    Iterate over a tensor, ignoring jit warnings.
+    """
+    # The "Iterating over a tensor" warning is erroneously a RuntimeWarning
+    # so we use a custom filter here.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Iterating over a tensor")
+        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+        return list(tensor)
+
+
+class optional:
     """
     Optionally wrap inside `context_manager` if condition is `True`.
     """
-    if condition:
-        with context_manager:
-            yield
-    else:
+    def __init__(self, context_manager, condition):
+        self.context_manager = context_manager
+        self.condition = condition
+
+    def __enter__(self):
+        if self.condition:
+            return self.context_manager.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.condition:
+            return self.context_manager.__exit__(exc_type, exc_val, exc_tb)
+
+
+class ExperimentalWarning(UserWarning):
+    pass
+
+
+@contextmanager
+def ignore_experimental_warning():
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=ExperimentalWarning)
         yield
 
 
@@ -342,3 +466,18 @@ def deep_getattr(obj, name):
     Throws an AttributeError if bad attribute
     """
     return functools.reduce(getattr, name.split("."), obj)
+
+
+class timed:
+    def __enter__(self, timer=timeit.default_timer):
+        self.start = timer()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.end = timeit.default_timer()
+        self.elapsed = self.end - self.start
+        return self.elapsed
+
+
+def torch_float(x):
+    return x.float() if isinstance(x, torch.Tensor) else float(x)

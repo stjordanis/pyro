@@ -1,10 +1,11 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Inference algorithms and utilities used in the RSA example models.
 
 Adapted from: http://dippl.org/chapters/03-enumeration.html
 """
-
-from __future__ import absolute_import, division, print_function
 
 import torch
 
@@ -16,13 +17,9 @@ from pyro.distributions.util import logsumexp
 from pyro.infer.abstract_infer import TracePosterior
 from pyro.poutine.runtime import NonlocalExit
 
-import six
-from six.moves import queue
+import queue
 import collections
-if six.PY3:
-    import functools
-else:
-    import functools32 as functools
+import functools
 
 
 def memoize(fn=None, **kwargs):
@@ -59,7 +56,7 @@ class HashingMarginal(dist.Distribution):
             "sites must be either '_RETURN' or list"
 
         self.sites = sites
-        super(HashingMarginal, self).__init__()
+        super().__init__()
         self.trace_dist = trace_dist
 
     has_enumerate_support = True
@@ -126,22 +123,21 @@ class HashingMarginal(dist.Distribution):
             return d
 
     def _weighted_mean(self, value, dim=0):
-        weights = self._dist_and_values()[0].logits
-        for _ in range(value.dim() - 1):
-            weights = weights.unsqueeze(-1)
-        max_val = weights.max(dim)[0]
-        return max_val.exp() * (value * (weights - max_val.unsqueeze(-1)).exp()).sum(dim=dim)
+        weights = self._log_weights.reshape([-1] + (value.dim() - 1) * [1])
+        max_weight = weights.max(dim=dim)[0]
+        relative_probs = (weights - max_weight).exp()
+        return (value * relative_probs).sum(dim=dim) / relative_probs.sum(dim=dim)
 
     @property
     def mean(self):
         samples = torch.stack(list(self._dist_and_values()[1].values()))
-        return self._weighted_mean(samples) / self._weighted_mean(samples.new_tensor([1.]))
+        return self._weighted_mean(samples)
 
     @property
     def variance(self):
         samples = torch.stack(list(self._dist_and_values()[1].values()))
         deviation_squared = torch.pow(samples - self.mean, 2)
-        return self._weighted_mean(deviation_squared) / self._weighted_mean(samples.new_tensor([1.]))
+        return self._weighted_mean(deviation_squared)
 
 
 ########################
@@ -155,7 +151,7 @@ class Search(TracePosterior):
     def __init__(self, model, max_tries=int(1e6), **kwargs):
         self.model = model
         self.max_tries = max_tries
-        super(Search, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def _traces(self, *args, **kwargs):
         q = queue.Queue()
@@ -213,7 +209,7 @@ class BestFirstSearch(TracePosterior):
             num_samples = 100
         self.num_samples = num_samples
         self.model = model
-        super(BestFirstSearch, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def _traces(self, *args, **kwargs):
         q = queue.PriorityQueue()

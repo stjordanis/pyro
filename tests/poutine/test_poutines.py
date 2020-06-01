@@ -1,14 +1,17 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import functools
+import io
 import logging
+import pickle
 import warnings
 from unittest import TestCase
 
 import pytest
 import torch
 import torch.nn as nn
-from six.moves.queue import Queue
+from queue import Queue
 
 import pyro
 import pyro.distributions as dist
@@ -16,7 +19,7 @@ import pyro.poutine as poutine
 from pyro.distributions import Bernoulli, Categorical, Normal
 from pyro.poutine.runtime import _DIM_ALLOCATOR, NonlocalExit
 from pyro.poutine.util import all_escape, discrete_escape
-from tests.common import assert_equal, assert_not_equal
+from tests.common import assert_equal, assert_not_equal, assert_close
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +280,7 @@ class QueueHandlerDiscreteTest(TestCase):
 
 class Model(nn.Module):
     def __init__(self):
-        super(Model, self).__init__()
+        super().__init__()
         self.fc = nn.Linear(2, 1)
 
     def forward(self, x):
@@ -330,8 +333,14 @@ class LiftHandlerTests(TestCase):
             latent2 = pyro.sample("latent2", Normal(loc2, scale2))
             return latent2
 
+        def dup_param_guide():
+            a = pyro.param("loc")
+            b = pyro.param("loc")
+            assert a == b
+
         self.model = Model()
         self.guide = guide
+        self.dup_param_guide = dup_param_guide
         self.prior = scale1_prior
         self.prior_dict = {"loc1": loc1_prior, "scale1": scale1_prior, "loc2": loc2_prior, "scale2": scale2_prior}
         self.partial_dict = {"loc1": loc1_prior, "scale1": scale1_prior}
@@ -347,6 +356,9 @@ class LiftHandlerTests(TestCase):
                 assert name not in lifted_tr
             else:
                 assert name in lifted_tr
+
+    def test_memoize(self):
+        poutine.trace(poutine.lift(self.dup_param_guide, prior=dist.Normal(0, 1)))()
 
     def test_prior_dict(self):
         tr = poutine.trace(self.guide).get_trace()
@@ -371,6 +383,7 @@ class LiftHandlerTests(TestCase):
             if name in ('scale2', 'loc2'):
                 assert lifted_tr.nodes[name]["type"] == "param"
 
+    @pytest.mark.filterwarnings('ignore::FutureWarning')
     def test_random_module(self):
         pyro.clear_param_store()
         with pyro.validation_enabled():
@@ -380,6 +393,7 @@ class LiftHandlerTests(TestCase):
                 assert lifted_tr.nodes[name]["type"] == "sample"
                 assert not lifted_tr.nodes[name]["is_observed"]
 
+    @pytest.mark.filterwarnings('ignore::FutureWarning')
     def test_random_module_warn(self):
         pyro.clear_param_store()
         bad_prior = {'foo': None}
@@ -391,6 +405,7 @@ class LiftHandlerTests(TestCase):
             for warning in w:
                 logger.info(warning)
 
+    @pytest.mark.filterwarnings('ignore::FutureWarning')
     def test_random_module_prior_dict(self):
         pyro.clear_param_store()
         lifted_nn = pyro.random_module("name", self.model, prior=self.nn_prior)
@@ -461,8 +476,8 @@ class IndirectLambdaHandlerTests(TestCase):
         def model(batch_size_outer=2, batch_size_inner=2):
             data = [[torch.ones(1)] * 2] * 2
             loc_latent = pyro.sample("loc_latent", dist.Normal(torch.zeros(1), torch.ones(1)))
-            for i in pyro.irange("irange_outer", 2, batch_size_outer):
-                for j in pyro.irange("irange_inner_%d" % i, 2, batch_size_inner):
+            for i in pyro.plate("plate_outer", 2, batch_size_outer):
+                for j in pyro.plate("plate_inner_%d" % i, 2, batch_size_inner):
                     pyro.sample("z_%d_%d" % (i, j), dist.Normal(loc_latent + data[i][j], torch.ones(1)))
 
         self.model = model
@@ -475,10 +490,10 @@ class IndirectLambdaHandlerTests(TestCase):
 
     def test_graph_structure(self):
         tracegraph = poutine.trace(self.model, graph_type="dense").get_trace()
-        # Ignore structure on irange_* nodes.
-        actual_nodes = set(n for n in tracegraph.nodes() if not n.startswith("irange_"))
+        # Ignore structure on plate_* nodes.
+        actual_nodes = set(n for n in tracegraph.nodes if not n.startswith("plate_"))
         actual_edges = set((n1, n2) for n1, n2 in tracegraph.edges
-                           if not n1.startswith("irange_") if not n2.startswith("irange_"))
+                           if not n1.startswith("plate_") if not n2.startswith("plate_"))
         assert actual_nodes == self.expected_nodes
         assert actual_edges == self.expected_edges
 
@@ -508,11 +523,6 @@ class ConditionHandlerTests(NormalNormalNormalHandlerTestCase):
             tr2.nodes["latent2"]["is_observed"]
         assert tr2.nodes["latent2"]["value"] is data["latent2"]
 
-    def test_do(self):
-        data = {"latent2": torch.randn(2)}
-        tr3 = poutine.trace(poutine.do(self.model, data=data)).get_trace()
-        assert "latent2" not in tr3
-
     def test_trace_data(self):
         tr1 = poutine.trace(
             poutine.block(self.model, expose_types=["sample"])).get_trace()
@@ -522,13 +532,14 @@ class ConditionHandlerTests(NormalNormalNormalHandlerTestCase):
             tr2.nodes["latent2"]["is_observed"]
         assert tr2.nodes["latent2"]["value"] is tr1.nodes["latent2"]["value"]
 
-    def test_stack_overwrite_failure(self):
+    def test_stack_overwrite_behavior(self):
         data1 = {"latent2": torch.randn(2)}
         data2 = {"latent2": torch.randn(2)}
-        cm = poutine.condition(poutine.condition(self.model, data=data1),
-                               data=data2)
-        with pytest.raises(AssertionError):
+        with poutine.trace() as tr:
+            cm = poutine.condition(poutine.condition(self.model, data=data1),
+                                   data=data2)
             cm()
+        assert tr.trace.nodes['latent2']['value'] is data2['latent2']
 
     def test_stack_success(self):
         data1 = {"latent1": torch.randn(2)}
@@ -542,23 +553,6 @@ class ConditionHandlerTests(NormalNormalNormalHandlerTestCase):
         assert tr.nodes["latent2"]["type"] == "sample" and \
             tr.nodes["latent2"]["is_observed"]
         assert tr.nodes["latent2"]["value"] is data2["latent2"]
-
-    def test_do_propagation(self):
-        pyro.clear_param_store()
-
-        def model():
-            z = pyro.sample("z", Normal(10.0 * torch.ones(1), 0.0001 * torch.ones(1)))
-            latent_prob = torch.exp(z) / (torch.exp(z) + torch.ones(1))
-            flip = pyro.sample("flip", Bernoulli(latent_prob))
-            return flip
-
-        sample_from_model = model()
-        z_data = {"z": -10.0 * torch.ones(1)}
-        # under model flip = 1 with high probability; so do indirect DO surgery to make flip = 0
-        sample_from_do_model = poutine.trace(poutine.do(model, data=z_data))()
-
-        assert eq(sample_from_model, torch.ones(1))
-        assert eq(sample_from_do_model, torch.zeros(1))
 
 
 class UnconditionHandlerTests(NormalNormalNormalHandlerTestCase):
@@ -661,7 +655,7 @@ class InferConfigHandlerTests(TestCase):
         assert tr.nodes["p"]["infer"] == {}
 
 
-@pytest.mark.parametrize('first_available_dim', [0, 1, 2])
+@pytest.mark.parametrize('first_available_dim', [-1, -2, -3])
 @pytest.mark.parametrize('depth', [0, 1, 2])
 def test_enumerate_poutine(depth, first_available_dim):
     num_particles = 2
@@ -681,11 +675,11 @@ def test_enumerate_poutine(depth, first_available_dim):
         actual_shape = log_prob.shape
         expected_shape = (2,) * depth
         if depth:
-            expected_shape = expected_shape + (1,) * first_available_dim
+            expected_shape = expected_shape + (1,) * (-1 - first_available_dim)
         assert actual_shape == expected_shape, 'error on iteration {}'.format(i)
 
 
-@pytest.mark.parametrize('first_available_dim', [0, 1, 2])
+@pytest.mark.parametrize('first_available_dim', [-1, -2, -3])
 @pytest.mark.parametrize('depth', [0, 1, 2])
 def test_replay_enumerate_poutine(depth, first_available_dim):
     num_particles = 2
@@ -694,7 +688,7 @@ def test_replay_enumerate_poutine(depth, first_available_dim):
     def guide():
         pyro.sample("y", y_dist, infer={"enumerate": "parallel"})
 
-    guide = poutine.enum(guide, first_available_dim=depth + first_available_dim)
+    guide = poutine.enum(guide, first_available_dim=first_available_dim - depth)
     guide = poutine.trace(guide)
     guide_trace = guide.get_trace()
 
@@ -716,8 +710,21 @@ def test_replay_enumerate_poutine(depth, first_available_dim):
         tr.compute_log_prob()
         log_prob = sum(site["log_prob"] for name, site in tr.iter_stochastic_nodes())
         actual_shape = log_prob.shape
-        expected_shape = (2,) * depth + (3,) + (2,) * depth + (1,) * first_available_dim
+        expected_shape = (2,) * depth + (3,) + (2,) * depth + (1,) * (-1 - first_available_dim)
         assert actual_shape == expected_shape, 'error on iteration {}'.format(i)
+
+
+@pytest.mark.parametrize("has_rsample", [False, True])
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_plate_preserves_has_rsample(has_rsample, depth):
+    def guide():
+        loc = pyro.param("loc", torch.tensor(0.))
+        with pyro.plate_stack("plates", (2,) * depth):
+            return pyro.sample("x", dist.Normal(loc, 1).has_rsample_(has_rsample))
+
+    x = guide()
+    assert x.dim() == depth
+    assert x.requires_grad == has_rsample
 
 
 def test_plate_error_on_enter():
@@ -782,34 +789,9 @@ def test_decorator_interface_queue():
         assert name in tr
 
 
-def test_decorator_interface_do():
-
-    sites = ["x", "y", "z", "_INPUT", "_RETURN"]
-    data = {"x": torch.ones(1)}
-
-    @poutine.do(data=data)
-    def model():
-        p = torch.tensor([0.5])
-        loc = torch.zeros(1)
-        scale = torch.ones(1)
-
-        x = pyro.sample("x", Normal(loc, scale))  # Before the discrete variable.
-        y = pyro.sample("y", Bernoulli(p))
-        z = pyro.sample("z", Normal(loc, scale))  # After the discrete variable.
-        return dict(x=x, y=y, z=z)
-
-    tr = poutine.trace(model).get_trace()
-    for name in sites:
-        if name not in data:
-            assert name in tr
-        else:
-            assert name not in tr
-            assert_equal(tr.nodes["_RETURN"]["value"][name], data[name])
-
-
 def test_method_decorator_interface_condition():
 
-    class cls_model(object):
+    class cls_model:
 
         @poutine.condition(data={"b": torch.tensor(1.)})
         def model(self, p):
@@ -823,3 +805,80 @@ def test_method_decorator_interface_condition():
     assert isinstance(tr, poutine.Trace)
     assert tr.graph_type == "flat"
     assert tr.nodes["b"]["is_observed"] and tr.nodes["b"]["value"].item() == 1.
+
+
+def test_trace_log_prob_err_msg():
+    def model(v):
+        pyro.sample("test_site", dist.Beta(1., 1.), obs=v)
+
+    tr = poutine.trace(model).get_trace(torch.tensor(2.))
+    exp_msg = r"Error while computing log_prob at site 'test_site':\s*" \
+              r"The value argument must be within the support"
+    with pytest.raises(ValueError, match=exp_msg):
+        tr.compute_log_prob()
+
+
+def test_trace_log_prob_sum_err_msg():
+    def model(v):
+        pyro.sample("test_site", dist.Beta(1., 1.), obs=v)
+
+    tr = poutine.trace(model).get_trace(torch.tensor(2.))
+    exp_msg = r"Error while computing log_prob_sum at site 'test_site':\s*" \
+              r"The value argument must be within the support"
+    with pytest.raises(ValueError, match=exp_msg):
+        tr.log_prob_sum()
+
+
+def test_trace_score_parts_err_msg():
+    def guide(v):
+        pyro.sample("test_site", dist.Beta(1., 1.), obs=v)
+
+    tr = poutine.trace(guide).get_trace(torch.tensor(2.))
+    exp_msg = r"Error while computing score_parts at site 'test_site':\s*" \
+              r"The value argument must be within the support"
+    with pytest.raises(ValueError, match=exp_msg):
+        tr.compute_score_parts()
+
+
+def _model(a=torch.tensor(1.), b=torch.tensor(1.)):
+    latent = pyro.sample("latent", dist.Beta(a, b))
+    return pyro.sample("test_site", dist.Bernoulli(latent), obs=torch.tensor(1))
+
+
+@pytest.mark.parametrize('wrapper', [
+    lambda fn: poutine.block(fn),
+    lambda fn: poutine.condition(fn, {'latent': 0.9}),
+    lambda fn: poutine.enum(fn, -1),
+    lambda fn: poutine.replay(fn, poutine.trace(fn).get_trace()),
+])
+def test_pickling(wrapper):
+    wrapped = wrapper(_model)
+    buffer = io.BytesIO()
+    # default protocol cannot serialize torch.Size objects (see https://github.com/pytorch/pytorch/issues/20823)
+    torch.save(wrapped, buffer, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+    buffer.seek(0)
+    deserialized = torch.load(buffer)
+    obs = torch.tensor(0.5)
+    pyro.set_rng_seed(0)
+    actual_trace = poutine.trace(deserialized).get_trace(obs)
+    pyro.set_rng_seed(0)
+    expected_trace = poutine.trace(wrapped).get_trace(obs)
+    assert tuple(actual_trace) == tuple(expected_trace.nodes)
+    assert_close([actual_trace.nodes[site]['value'] for site in actual_trace.stochastic_nodes],
+                 [expected_trace.nodes[site]['value'] for site in expected_trace.stochastic_nodes])
+
+
+def test_arg_kwarg_error():
+
+    def model():
+        pyro.param("p", torch.zeros(1, requires_grad=True))
+        pyro.sample("a", Bernoulli(torch.tensor([0.5])),
+                    infer={"enumerate": "parallel"})
+        pyro.sample("b", Bernoulli(torch.tensor([0.5])))
+
+    with pytest.raises(ValueError, match="not callable"):
+        with poutine.mask(False):
+            model()
+
+    with poutine.mask(mask=False):
+        model()

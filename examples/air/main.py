@@ -1,3 +1,6 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 AIR applied to the multi-mnist data set [1].
 
@@ -5,7 +8,7 @@ AIR applied to the multi-mnist data set [1].
 understanding with generative models." Advances in Neural Information
 Processing Systems. 2016.
 """
-from __future__ import division
+
 
 import argparse
 import math
@@ -16,12 +19,13 @@ from functools import partial
 import numpy as np
 import torch
 import visdom
-from observations import multi_mnist
 
 import pyro
+import pyro.contrib.examples.multi_mnist as multi_mnist
 import pyro.optim as optim
 import pyro.poutine as poutine
 from air import AIR, latents_to_tensor
+from pyro.contrib.examples.util import get_data_directory
 from pyro.infer import SVI, JitTraceGraph_ELBO, TraceGraph_ELBO
 from viz import draw_many, tensor_to_objs
 
@@ -110,8 +114,8 @@ def exp_decay(initial, final, begin, duration, t):
 
 
 def load_data():
-    inpath = './data'
-    (X_np, Y), _ = multi_mnist(inpath, max_digits=2, canvas_size=50, seed=42)
+    inpath = get_data_directory(__file__)
+    X_np, Y = multi_mnist.load(inpath)
     X_np = X_np.astype(np.float32)
     X_np /= 255.0
     X = torch.from_numpy(X_np)
@@ -244,6 +248,7 @@ def main(**kwargs):
 
 
 if __name__ == '__main__':
+    assert pyro.__version__.startswith('1.3.1')
     parser = argparse.ArgumentParser(description="Pyro AIR example", argument_default=argparse.SUPPRESS)
     parser.add_argument('-n', '--num-steps', type=int, default=int(1e8),
                         help='number of optimization steps to take')

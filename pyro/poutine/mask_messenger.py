@@ -1,23 +1,33 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
+
+from pyro.util import ignore_jit_warnings
 
 from .messenger import Messenger
 
 
 class MaskMessenger(Messenger):
     """
-    This messenger masks sample sites.
+    Given a stochastic function with some batched sample statements and
+    masking tensor, mask out some of the sample statements elementwise.
 
-    This is typically used for masking out parts of tensors.
-
-    :param torch.ByteTensor mask: a ``{0,1}``-valued masking tensor
+    :param fn: a stochastic function (callable containing Pyro primitive calls)
+    :param torch.BoolTensor mask: a ``{0,1}``-valued masking tensor
         (1 includes a site, 0 excludes a site)
+    :returns: stochastic function decorated with a :class:`~pyro.poutine.scale_messenger.MaskMessenger`
     """
     def __init__(self, mask):
-        if not isinstance(mask, torch.Tensor) or mask.dtype != torch.uint8:
-            raise ValueError('Expected mask to e a ByteTensor but got {}'.format(type(mask)))
-        super(MaskMessenger, self).__init__()
+        if isinstance(mask, torch.Tensor):
+            if mask.dtype != torch.bool:
+                raise ValueError('Expected mask to be a BoolTensor but got {}'.format(type(mask)))
+        else:
+            if mask not in (True, False):
+                raise ValueError('Expected mask to be a boolean but got {}'.format(type(mask)))
+            with ignore_jit_warnings():
+                mask = torch.tensor(mask)
+        super().__init__()
         self.mask = mask
 
     def _process_message(self, msg):

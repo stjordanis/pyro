@@ -1,226 +1,40 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import itertools
-from abc import ABCMeta, abstractmethod
+import warnings
 from collections import OrderedDict, defaultdict
 
 import opt_einsum
 import torch
 from opt_einsum import shared_intermediates
-from six import add_metaclass
-from six.moves import map
 
-from pyro.distributions.util import broadcast_shape
-from pyro.ops.einsum import contract
-from pyro.ops.sumproduct import logsumproductexp
+from pyro.ops.rings import BACKEND_TO_RING, LogRing
+from pyro.util import ignore_jit_warnings
 
 
-@add_metaclass(ABCMeta)
-class TensorRing(object):
-    """
-    Abstract tensor ring class.
-
-    Each tensor ring class has a notion of ``dims`` that can be sum-contracted
-    out, and a notion of ``ordinal`` that represents a set of batch dimensions
-    that can be broadcasted-up or product-contracted out.
-    Implementations should cache intermediate results to be compatible with
-    :func:`~opt_einsum.shared_intermediates`.
-
-    :param dict cache: an optional :func:`~opt_einsum.shared_intermediates`
-        cache.
-    """
-    def __init__(self, cache=None):
-        self._cache = {} if cache is None else cache
-
-    def _save_tensor(self, tensor):
-        """
-        Saves a tensor in the cache so that ``id(tensor)`` can be used as a
-        key in the cache without risk if the id being recycled.
-        """
-        self._cache['tensor', id(tensor)] = tensor
-
-    @abstractmethod
-    def dims(self, term):
-        """
-        Returns an iterable of nontrivial dims associted with this term.
-        Derived classes may use any hashable type for dims.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def sumproduct(self, terms, dims):
-        """
-        Multiply all ``terms`` together, then sum-contract out all ``dims``
-        from the result.
-
-        :param list terms: a list of tensors
-        :dims: an iterable of dims
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def product(self, term, ordinal):
-        """
-        Product-contract the given ``term`` along any batch dimensions
-        present in given ``ordinal``.
-
-        :param torch.Tensor term: the term to contract
-        :param frozenset ordinal: an ordinal specifying batch context
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def broadcast(self, tensor, ordinal):
-        """
-        Broadcast the given ``term`` by expanding along any batch dimensions
-        present in ``ordinal`` but not ``term``.
-
-        :param torch.Tensor term: the term to expand
-        :param frozenset ordinal: an ordinal specifying batch context
-        """
-        raise NotImplementedError
+def _check_plates_are_sensible(output_dims, nonoutput_ordinal):
+    if output_dims and nonoutput_ordinal:
+        raise ValueError(u"It is nonsensical to preserve a plated dim without preserving "
+                         u"all of that dim's plates, but found '{}' without '{}'"
+                         .format(output_dims, ','.join(nonoutput_ordinal)))
 
 
-class UnpackedLogRing(TensorRing):
-    """
-    Tensor Ring defined by high-dimensional unpacked tensors in log space.
-
-    Tensor values are in log units, so ``sum`` is implemented as ``logsumexp``,
-    and ``product`` is implemented as ``sum``.
-    Tensor shapes are typically wide with only a few nontrivial dimensions::
-
-        torch.Size((7, 1, 1, 1, 1, 1, 3, 1, 1, 2))
-
-    Dims are negative integers indexing into tensors shapes from the right.
-    Ordinals are frozensets of ``CondIndepStackFrame``s.
-    """
-    def dims(self, term):
-        return [d for d in range(-term.dim(), 0) if term.size(d) > 1]
-
-    def sumproduct(self, terms, dims):
-        key = 'sumproduct', frozenset(id(x) for x in terms), frozenset(dims)
-        if key in self._cache:
-            return self._cache[key]
-
-        if dims:
-            assert all(dim < 0 for dim in dims)
-            shape = list(broadcast_shape(*set(x.shape for x in terms)))
-            for dim in dims:
-                shape[dim] = 1
-            term = logsumproductexp(terms, tuple(shape))
-        else:
-            term = sum(terms)
-
-        # Aggressively squeeze to improve sharing.
-        while term.dim() and term.size(0) == 1:
-            term = term.squeeze(0)
-        self._save_tensor(term)
-        self._cache[key] = term
-        return term
-
-    def product(self, term, ordinal):
-        for frame in sorted(ordinal, key=lambda f: -f.dim):
-            if -frame.dim <= term.dim() and term.size(frame.dim) != 1:
-                key = 'product', id(term), frame.dim
-                if key in self._cache:
-                    term = self._cache[key]
-                else:
-                    self._save_tensor(term)
-                    term = term.sum(frame.dim, keepdim=True)
-                    self._cache[key] = term
-        return term
-
-    def broadcast(self, term, ordinal):
-        shape = list(term.shape)
-        for frame in ordinal:
-            shape = [1] * (-frame.dim - len(shape)) + shape
-            shape[frame.dim] = frame.size
-        shape = torch.Size(shape)
-        if term.shape == shape:
-            return term
-        key = 'broadcast', id(term), shape
-        if key in self._cache:
-            return self._cache[key]
-        self._save_tensor(term)
-        term = term.expand(shape)
-        self._cache[key] = term
-        return term
-
-
-class PackedLogRing(TensorRing):
-    """
-    Tensor Ring of packed tensors with named dimensions in log space.
-
-    Tensor values are in log units, so ``sum`` is implemented as ``logsumexp``,
-    and ``product`` is implemented as ``sum``.
-    Tensor dimensions are packed; to read the name of a tensor, call
-    :meth:`dims`, which returns a string of dimension names aligned with the
-    tensor's shape.
-
-    Dims are characters (string or unicode).
-    Ordinals are frozensets of characters.
-    """
-    def __init__(self, inputs, operands, cache=None):
-        super(PackedLogRing, self).__init__(cache=cache)
-        self._batch_size = {}
-        for dims, term in zip(inputs, operands):
-            self._save_tensor(term)
-            self._cache['dims', id(term)] = dims
-            for dim, size in zip(dims, term.shape):
-                old = self._batch_size.setdefault(dim, size)
-                if old != size:
-                    raise ValueError(u"Dimension size mismatch at dim '{}': {} vs {}"
-                                     .format(dim, size, old))
-
-    def dims(self, term):
-        return self._cache['dims', id(term)]
-
-    def sumproduct(self, terms, dims):
-        inputs = [self.dims(term) for term in terms]
-        output = ''.join(sorted(set(''.join(inputs)) - set(dims)))
-        equation = ','.join(inputs) + '->' + output
-        term = contract(equation, *terms, backend='pyro.ops.einsum.torch_log')
-        self._save_tensor(term)
-        self._cache['dims', id(term)] = output
-        return term
-
-    def product(self, term, ordinal):
-        dims = self.dims(term)
-        for dim in sorted(ordinal, reverse=True):
-            pos = dims.find(dim)
-            if pos != -1:
-                key = 'product', id(term), dim
-                if key in self._cache:
-                    term = self._cache[key]
-                else:
-                    self._save_tensor(term)
-                    term = term.sum(pos)
-                    dims = dims.replace(dim, '')
-                    self._cache[key] = term
-                    self._cache['dims', id(term)] = dims
-        return term
-
-    def broadcast(self, term, ordinal):
-        dims = self.dims(term)
-        missing_dims = ''.join(sorted(set(ordinal) - set(dims)))
-        if missing_dims:
-            key = 'broadcast', id(term), missing_dims
-            if key in self._cache:
-                term = self._cache[key]
-            else:
-                missing_shape = tuple(self._batch_size[dim] for dim in missing_dims)
-                term = term.expand(missing_shape + term.shape)
-                dims = missing_dims + dims
-                self._cache[key] = term
-                self._cache['dims', id(term)] = dims
-        return term
+def _check_tree_structure(parent, leaf):
+    if parent == leaf:
+        raise NotImplementedError(
+            "Expected tree-structured plate nesting, but found "
+            "dependencies on independent plates [{}]. "
+            "Try converting one of the vectorized plates to a sequential plate (but beware "
+            "exponential cost in the size of the sequence)"
+            .format(', '.join(getattr(f, 'name', str(f)) for f in leaf)))
 
 
 def _partition_terms(ring, terms, dims):
     """
     Given a list of terms and a set of contraction dims, partitions the terms
     up into sets that must be contracted together. By separating these
-    components we avoid broadcasting. This function should be deterministic.
+    components we avoid broadcasting.
 
     This function should be deterministic and free of side effects.
     """
@@ -228,12 +42,13 @@ def _partition_terms(ring, terms, dims):
     # are enumerated. This conflates terms and dims (tensors and ints).
     neighbors = OrderedDict([(t, []) for t in terms] + [(d, []) for d in sorted(dims)])
     for term in terms:
-        for dim in ring.dims(term):
+        for dim in term._pyro_dims:
             if dim in dims:
                 neighbors[term].append(dim)
                 neighbors[dim].append(term)
 
     # Partition the bipartite graph into connected components for contraction.
+    components = []
     while neighbors:
         v, pending = neighbors.popitem()
         component = OrderedDict([(v, None)])  # used as an OrderedSet
@@ -250,50 +65,48 @@ def _partition_terms(ring, terms, dims):
         component_terms = [v for v in component if isinstance(v, torch.Tensor)]
         if component_terms:
             component_dims = set(v for v in component if not isinstance(v, torch.Tensor))
-            yield component_terms, component_dims
+            components.append((component_terms, component_dims))
+    return components
 
 
-def _contract_component(ring, tensor_tree, sum_dims):
+def _contract_component(ring, tensor_tree, sum_dims, target_dims):
     """
-    Contract out ``sum_dims`` in a tree of tensors in-place, via message
-    passing. This reduces all tensors down to a single tensor in the greatest
-    lower bound plate context.
+    Contract out ``sum_dims - target_dims`` in a tree of tensors in-place, via
+    message passing. This reduces all tensors down to a single tensor in the
+    minimum plate context.
 
     This function should be deterministic.
-    This function has side-effects: it modifies ``tensor_tree`` and
-    ``sum_dims`` in-place.
+    This function has side-effects: it modifies ``tensor_tree``.
 
-    :param TensorRing ring: an algebraic ring defining tensor operations.
+    :param pyro.ops.rings.Ring ring: an algebraic ring defining tensor
+        operations.
     :param OrderedDict tensor_tree: a dictionary mapping ordinals to lists of
         tensors. An ordinal is a frozenset of ``CondIndepStack`` frames.
-    :param dict sum_dims: a dictionary mapping tensors to sets of dimensions
-        (indexed from the right) that should be summed out.
+    :param set sum_dims: the complete set of sum-contractions dimensions
+        (indexed from the right). This is needed to distinguish sum-contraction
+        dimensions from product-contraction dimensions.
+    :param set target_dims: An subset of ``sum_dims`` that should be preserved
+        in the result.
+    :return: a pair ``(ordinal, tensor)``
+    :rtype: tuple of frozenset and torch.Tensor
     """
-    # First close the set of ordinals under intersection (greatest lower bound),
-    # ensuring that the ordinals are arranged in a tree structure.
-    target_ordinal = frozenset.intersection(*tensor_tree)
-    tensor_tree.setdefault(target_ordinal, [])
-    pending = list(tensor_tree)
-    while pending:
-        t = pending.pop()
-        for u in list(tensor_tree):
-            tu = t & u
-            if tu not in tensor_tree:
-                tensor_tree[tu] = []
-                pending.append(tu)
-
-    # Collect contraction dimensions by ordinal.
+    # Group sum dims by ordinal.
     dim_to_ordinal = {}
     for t, terms in tensor_tree.items():
         for term in terms:
-            for dim in sum_dims[term]:
+            for dim in sum_dims.intersection(term._pyro_dims):
                 dim_to_ordinal[dim] = dim_to_ordinal.get(dim, t) & t
     dims_tree = defaultdict(set)
     for dim, t in dim_to_ordinal.items():
         dims_tree[t].add(dim)
 
     # Recursively combine terms in different plate contexts.
+    local_terms = []
+    local_dims = target_dims.copy()
+    local_ordinal = frozenset()
+    min_ordinal = frozenset.intersection(*tensor_tree)
     while any(dims_tree.values()):
+        # Arbitrarily deterministically choose a leaf.
         leaf = max(tensor_tree, key=len)
         leaf_terms = tensor_tree.pop(leaf)
         leaf_dims = dims_tree.pop(leaf, set())
@@ -301,196 +114,244 @@ def _contract_component(ring, tensor_tree, sum_dims):
         # Split terms at the current ordinal into connected components.
         for terms, dims in _partition_terms(ring, leaf_terms, leaf_dims):
 
-            # Eliminate any enumeration dims via a sumproduct contraction.
-            term = ring.sumproduct(terms, dims)
-            remaining_dims = set.union(*map(sum_dims.pop, terms)) - dims
+            # Eliminate sum dims via a sumproduct contraction.
+            term = ring.sumproduct(terms, dims - local_dims)
 
             # Eliminate extra plate dims via product contractions.
-            if leaf == target_ordinal:
+            if leaf == min_ordinal:
                 parent = leaf
             else:
-                parent = frozenset.union(*(t for t, d in dims_tree.items() if d & remaining_dims))
-                if parent == leaf:
-                    raise NotImplementedError(
-                        "Expected tree-structured plate nesting, but found "
-                        "dependencies on independent plates [{}]. "
-                        "Try converting one of the plates to an irange (but beware "
-                        "exponential cost in the size of that irange)"
-                        .format(', '.join(getattr(f, 'name', str(f)) for f in leaf)))
+                pending_dims = sum_dims.intersection(term._pyro_dims)
+                parent = frozenset.union(*(t for t, d in dims_tree.items() if d & pending_dims))
+                _check_tree_structure(parent, leaf)
                 contract_frames = leaf - parent
-                term = ring.product(term, contract_frames)
-
+                contract_dims = dims & local_dims
+                if contract_dims:
+                    term, local_term = ring.global_local(term, contract_dims, contract_frames)
+                    local_terms.append(local_term)
+                    local_dims |= sum_dims.intersection(local_term._pyro_dims)
+                    local_ordinal |= leaf
+                else:
+                    term = ring.product(term, contract_frames)
             tensor_tree.setdefault(parent, []).append(term)
-            sum_dims[term] = remaining_dims
+
+    # Extract single tensor at root ordinal.
+    assert len(tensor_tree) == 1
+    ordinal, (term,) = tensor_tree.popitem()
+    assert ordinal == min_ordinal
+
+    # Perform optional localizing pass.
+    if local_terms:
+        assert target_dims
+        local_terms.append(term)
+        term = ring.sumproduct(local_terms, local_dims - target_dims)
+        ordinal |= local_ordinal
+
+    return ordinal, term
 
 
-def contract_tensor_tree(tensor_tree, sum_dims, ring=None, cache=None):
+def contract_tensor_tree(tensor_tree, sum_dims, cache=None, ring=None):
     """
     Contract out ``sum_dims`` in a tree of tensors via message passing.
+    This partially contracts out plate dimensions.
 
     This function should be deterministic and free of side effects.
 
     :param OrderedDict tensor_tree: a dictionary mapping ordinals to lists of
         tensors. An ordinal is a frozenset of ``CondIndepStack`` frames.
-    :param dict sum_dims: a dictionary mapping tensors to sets of dimensions
-        (indexed from the right) that should be summed out.
-    :param TensorRing ring: an algebraic ring defining tensor operations.
+    :param set sum_dims: the complete set of sum-contractions dimensions
+        (indexed from the right). This is needed to distinguish sum-contraction
+        dimensions from product-contraction dimensions.
     :param dict cache: an optional :func:`~opt_einsum.shared_intermediates`
         cache.
+    :param pyro.ops.rings.Ring ring: an optional algebraic ring defining tensor
+        operations.
     :returns: A contracted version of ``tensor_tree``
     :rtype: OrderedDict
     """
-    if ring is None:
-        ring = UnpackedLogRing(cache=cache)
     assert isinstance(tensor_tree, OrderedDict)
-    assert isinstance(sum_dims, dict)
-    assert isinstance(ring, TensorRing)
+    assert isinstance(sum_dims, set)
+
+    if ring is None:
+        ring = LogRing(cache)
 
     ordinals = {term: t for t, terms in tensor_tree.items() for term in terms}
     all_terms = [term for terms in tensor_tree.values() for term in terms]
-    all_dims = set.union(*sum_dims.values())
     contracted_tree = OrderedDict()
 
     # Split this tensor tree into connected components.
-    for terms, dims in _partition_terms(ring, all_terms, all_dims):
-
+    for terms, dims in _partition_terms(ring, all_terms, sum_dims):
         component = OrderedDict()
-        component_dims = {}
         for term in terms:
             component.setdefault(ordinals[term], []).append(term)
-            component_dims[term] = sum_dims[term]
 
         # Contract this connected component down to a single tensor.
-        _contract_component(ring, component, component_dims)
-        assert len(component) == 1
-        t, terms = component.popitem()
-        assert len(terms) == 1
-        contracted_tree.setdefault(t, []).extend(terms)
+        ordinal, term = _contract_component(ring, component, dims, set())
+        contracted_tree.setdefault(ordinal, []).append(term)
 
     return contracted_tree
 
 
-def contract_to_tensor(tensor_tree, sum_dims, target_ordinal, ring=None, cache=None):
+def contract_to_tensor(tensor_tree, sum_dims, target_ordinal=None, target_dims=None,
+                       cache=None, ring=None):
     """
     Contract out ``sum_dims`` in a tree of tensors, via message
     passing. This reduces all terms down to a single tensor in the plate
-    context specified by ``target_ordinal``.
+    context specified by ``target_ordinal``, optionally preserving sum
+    dimensions ``target_dims``.
 
     This function should be deterministic and free of side effects.
 
     :param OrderedDict tensor_tree: a dictionary mapping ordinals to lists of
         tensors. An ordinal is a frozenset of ``CondIndepStack`` frames.
-    :param dict sum_dims: a dictionary mapping tensors to sets of dimensions
-        (indexed from the right) that should be summed out.
-    :param frozendset target_ordinal: An optional ordinal to which results will
-        be contracted or broadcasted.
-    :param TensorRing ring: an algebraic ring defining tensor operations.
+    :param set sum_dims: the complete set of sum-contractions dimensions
+        (indexed from the right). This is needed to distinguish sum-contraction
+        dimensions from product-contraction dimensions.
+    :param frozenset target_ordinal: An optional ordinal to which the result
+        will be contracted or broadcasted.
+    :param set target_dims: An optional subset of ``sum_dims`` that should be
+        preserved in the result.
     :param dict cache: an optional :func:`~opt_einsum.shared_intermediates`
         cache.
+    :param pyro.ops.rings.Ring ring: an optional algebraic ring defining tensor
+        operations.
     :returns: a single tensor
     :rtype: torch.Tensor
     """
-    if ring is None:
-        ring = UnpackedLogRing(cache=cache)
+    if target_ordinal is None:
+        target_ordinal = frozenset()
+    if target_dims is None:
+        target_dims = set()
     assert isinstance(tensor_tree, OrderedDict)
-    assert isinstance(sum_dims, dict)
+    assert isinstance(sum_dims, set)
     assert isinstance(target_ordinal, frozenset)
-    assert isinstance(ring, TensorRing)
+    assert isinstance(target_dims, set) and target_dims <= sum_dims
+    if ring is None:
+        ring = LogRing(cache)
 
-    # Contract out all sum dims via sumproduct contractions.
-    tensor_tree = contract_tensor_tree(tensor_tree, sum_dims, ring=ring)
+    ordinals = {term: t for t, terms in tensor_tree.items() for term in terms}
+    all_terms = [term for terms in tensor_tree.values() for term in terms]
+    contracted_terms = []
 
-    # Eliminate extra plate dims via product contractions.
-    lower_terms = []
-    lower_ordinal = frozenset()
-    for ordinal, terms in tensor_tree.items():
+    # Split this tensor tree into connected components.
+    modulo_total = bool(target_dims)
+    for terms, dims in _partition_terms(ring, all_terms, sum_dims):
+        if modulo_total and dims.isdisjoint(target_dims):
+            continue
+        component = OrderedDict()
+        for term in terms:
+            component.setdefault(ordinals[term], []).append(term)
+
+        # Contract this connected component down to a single tensor.
+        ordinal, term = _contract_component(ring, component, dims, target_dims & dims)
+        _check_plates_are_sensible(target_dims.intersection(term._pyro_dims),
+                                   ordinal - target_ordinal)
+
+        # Eliminate extra plate dims via product contractions.
         contract_frames = ordinal - target_ordinal
         if contract_frames:
-            ordinal = ordinal & target_ordinal
-            terms = [ring.product(term, contract_frames) for term in terms]
-        lower_terms.extend(terms)
-        lower_ordinal = lower_ordinal | ordinal
-    assert lower_ordinal <= target_ordinal
+            assert not sum_dims.intersection(term._pyro_dims)
+            term = ring.product(term, contract_frames)
 
-    # Combine and broadcast terms.
-    lower_term = ring.sumproduct(lower_terms, set())
-    return ring.broadcast(lower_term, target_ordinal)
+        contracted_terms.append(term)
+
+    # Combine contracted tensors via product, then broadcast.
+    term = ring.sumproduct(contracted_terms, set())
+    assert sum_dims.intersection(term._pyro_dims) <= target_dims
+    return ring.broadcast(term, target_ordinal)
 
 
-def ubersum(equation, *operands, **kwargs):
+def einsum(equation, *operands, **kwargs):
     """
-    Generalized batched sum-product algorithm via tensor message passing.
+    Generalized plated sum-product algorithm via tensor variable elimination.
 
     This generalizes :func:`~pyro.ops.einsum.contract` in two ways:
 
     1.  Multiple outputs are allowed, and intermediate results can be shared.
-    2.  Inputs and outputs can be batched along symbols given in ``batch_dims``;
-        reductions along ``batch_dims`` are product reductions.
+    2.  Inputs and outputs can be plated along symbols given in ``plates``;
+        reductions along ``plates`` are product reductions.
 
     The best way to understand this function is to try the examples below,
-    which show how :func:`ubersum` calls can be implemented as multiple calls
+    which show how :func:`einsum` calls can be implemented as multiple calls
     to :func:`~pyro.ops.einsum.contract` (which is generally more expensive).
 
     To illustrate multiple outputs, note that the following are equivalent::
 
-        z1, z2, z3 = ubersum('ab,bc->a,b,c', x, y)  # multiple outputs
+        z1, z2, z3 = einsum('ab,bc->a,b,c', x, y)  # multiple outputs
 
-        backend = 'pyro.ops.einsum.torch_log'
-        z1 = contract('ab,bc->a', x, y, backend=backend)
-        z2 = contract('ab,bc->b', x, y, backend=backend)
-        z3 = contract('ab,bc->c', x, y, backend=backend)
+        z1 = contract('ab,bc->a', x, y)
+        z2 = contract('ab,bc->b', x, y)
+        z3 = contract('ab,bc->c', x, y)
 
-    To illustrate batched inputs, note that the following are equivalent::
+    To illustrate plated inputs, note that the following are equivalent::
 
         assert len(x) == 3 and len(y) == 3
-        z = ubersum('c,abc,acd->bd', w, x, y, batch_dims='a')
+        z = einsum('ab,ai,bi->b', w, x, y, plates='i')
 
-        z = contract('c,bc,bc,bc,cd,cd,cd->bd', w, *x, *y, backend=backend)
+        z = contract('ab,a,a,a,b,b,b->b', w, *x, *y)
 
-    When a non-batch dimension `i` always appears with a batch dimension `a`,
-    then `i` corresponds to a distinct symbol for each slice of `a`. Thus
+    When a sum dimension `a` always appears with a plate dimension `i`,
+    then `a` corresponds to a distinct symbol for each slice of `a`. Thus
     the following are equivalent::
 
         assert len(x) == 3 and len(y) == 3
-        z = ubersum('abi,abi->', x, y, batch_dims='a')
+        z = einsum('ai,ai->', x, y, plates='i')
 
-        z = contract('bi,bj,bk,bi,bj,bk->', *x, *y, backend=backend)
+        z = contract('a,b,c,a,b,c->', *x, *y)
 
-    When such a non-batched dimension appears in the output, it must be
-    accompanied by all of its batch dimensions, e.g. the following are
+    When such a sum dimension appears in the output, it must be
+    accompanied by all of its plate dimensions, e.g. the following are
     equivalent::
 
         assert len(x) == 3 and len(y) == 3
-        z = ubersum('abi,abi->ai', x, y, batch_dims='a')
+        z = einsum('abi,abi->bi', x, y, plates='i')
 
-        z0 = contract('bi,bj,bk,bi,bj,bk->i', *x, *y, backend=backend)
-        z1 = contract('bi,bj,bk,bi,bj,bk->j', *x, *y, backend=backend)
-        z2 = contract('bi,bj,bk,bi,bj,bk->k', *x, *y, backend=backend)
+        z0 = contract('ab,ac,ad,ab,ac,ad->b', *x, *y)
+        z1 = contract('ab,ac,ad,ab,ac,ad->c', *x, *y)
+        z2 = contract('ab,ac,ad,ab,ac,ad->d', *x, *y)
         z = torch.stack([z0, z1, z2])
 
-    Among all valid inputs, some computations are polynomial in the sizes of
+    Note that each plate slice through the output is multilinear in all plate
+    slices through all inptus, thus e.g. batch matrix multiply would be
+    implemented *without* ``plates``, so the following are all equivalent::
+
+        xy = einsum('abc,acd->abd', x, y, plates='')
+        xy = torch.stack([xa.mm(ya) for xa, ya in zip(x, y)])
+        xy = torch.bmm(x, y)
+
+    Among all valid equations, some computations are polynomial in the sizes of
     the input tensors and other computations are exponential in the sizes of
     the input tensors. This function raises :py:class:`NotImplementedError`
     whenever the computation is exponential.
 
-    :param str equation: an einsum equation, optionally with multiple outputs.
-    :param torch.Tensor operands: a collection of tensors
-    :param str batch_dims: an optional string of batch dims.
-    :param dict cache: an optional :func:`~opt_einsum.shared_intermediates`
+    :param str equation: An einsum equation, optionally with multiple outputs.
+    :param torch.Tensor operands: A collection of tensors.
+    :param str plates: An optional string of plate symbols.
+    :param str backend: An optional einsum backend, defaults to 'torch'.
+    :param dict cache: An optional :func:`~opt_einsum.shared_intermediates`
         cache.
+    :param bool modulo_total: Optionally allow einsum to arbitrarily scale
+        each result plate, which can significantly reduce computation. This is
+        safe to set whenever each result plate denotes a nonnormalized
+        probability distribution whose total is not of interest.
     :return: a tuple of tensors of requested shape, one entry per output.
     :rtype: tuple
     :raises ValueError: if tensor sizes mismatch or an output requests a
-        batched dim without that dim's batch dims.
+        plated dim without that dim's plates.
     :raises NotImplementedError: if contraction would have cost exponential in
         the size of any input tensor.
     """
     # Extract kwargs.
     cache = kwargs.pop('cache', None)
-    batch_dims = kwargs.pop('batch_dims', '')
-    backend = kwargs.pop('backend', 'pyro.ops.einsum.torch_log')
-    if backend != 'pyro.ops.einsum.torch_log':
-        raise NotImplementedError
+    plates = kwargs.pop('plates', '')
+    backend = kwargs.pop('backend', 'torch')
+    modulo_total = kwargs.pop('modulo_total', False)
+    try:
+        Ring = BACKEND_TO_RING[backend]
+    except KeyError:
+        raise NotImplementedError('\n'.join(
+            ['Only the following pyro backends are currently implemented:'] +
+            list(BACKEND_TO_RING)))
 
     # Parse generalized einsum equation.
     if '.' in equation:
@@ -500,31 +361,60 @@ def ubersum(equation, *operands, **kwargs):
     outputs = outputs.split(',')
     assert len(inputs) == len(operands)
     assert all(isinstance(x, torch.Tensor) for x in operands)
+    if not modulo_total and any(outputs):
+        raise NotImplementedError('Try setting modulo_total=True and ensuring that your use case '
+                                  'allows an arbitrary scale factor on each result plate.')
     if len(operands) != len(set(operands)):
         operands = [x[...] for x in operands]  # ensure tensors are unique
 
+    # Check sizes.
+    with ignore_jit_warnings():
+        dim_to_size = {}
+        for dims, term in zip(inputs, operands):
+            for dim, size in zip(dims, map(int, term.shape)):
+                old = dim_to_size.setdefault(dim, size)
+                if old != size:
+                    raise ValueError(u"Dimension size mismatch at dim '{}': {} vs {}"
+                                     .format(dim, size, old))
+
     # Construct a tensor tree shared by all outputs.
     tensor_tree = OrderedDict()
-    max_ordinal = frozenset(batch_dims)
+    plates = frozenset(plates)
     for dims, term in zip(inputs, operands):
         assert len(dims) == term.dim()
-        ordinal = frozenset(dims) & max_ordinal
+        term._pyro_dims = dims
+        ordinal = plates.intersection(dims)
         tensor_tree.setdefault(ordinal, []).append(term)
 
     # Compute outputs, sharing intermediate computations.
     results = []
     with shared_intermediates(cache) as cache:
-        ring = PackedLogRing(inputs, operands, cache=cache)
+        ring = Ring(cache, dim_to_size=dim_to_size)
         for output in outputs:
-            nosum_dims = set(batch_dims + output)
-            sum_dims = {term: set(dims) - nosum_dims for dims, term in zip(inputs, operands)}
-            target_ordinal = frozenset(output) & max_ordinal
-            term = contract_to_tensor(tensor_tree, sum_dims, target_ordinal, ring=ring)
-            dims = ring.dims(term)
-            if dims != output:
-                term = term.permute(*map(dims.index, output))
+            sum_dims = set(output).union(*inputs) - set(plates)
+            term = contract_to_tensor(tensor_tree, sum_dims,
+                                      target_ordinal=plates.intersection(output),
+                                      target_dims=sum_dims.intersection(output),
+                                      ring=ring)
+            if term._pyro_dims != output:
+                term = term.permute(*map(term._pyro_dims.index, output))
+                term._pyro_dims = output
             results.append(term)
     return tuple(results)
+
+
+def ubersum(equation, *operands, **kwargs):
+    """
+    Deprecated, use :func:`einsum` instead.
+    """
+    warnings.warn("'ubersum' is deprecated, use 'pyro.ops.contract.einsum' instead",
+                  DeprecationWarning)
+    if 'batch_dims' in kwargs:
+        warnings.warn("'batch_dims' is deprecated, use 'plates' instead",
+                      DeprecationWarning)
+        kwargs['plates'] = kwargs.pop('batch_dims')
+    kwargs.setdefault('backend', 'pyro.ops.einsum.torch_log')
+    return einsum(equation, *operands, **kwargs)
 
 
 def _select(tensor, dims, indices):
@@ -533,12 +423,12 @@ def _select(tensor, dims, indices):
     return tensor
 
 
-class _DimFlattener(object):
+class _DimUnroller:
     """
-    Object to map batched dims to batches of flat dims.
+    Object to map plated dims to collections of unrolled dims.
 
     :param dict dim_to_ordinal: a mapping from contraction dim to the set of
-        batch dims over which the contraction dim is batched.
+        plates over which the contraction dim is plated.
     """
     def __init__(self, dim_to_ordinal):
         self._plates = {d: tuple(sorted(ordinal)) for d, ordinal in dim_to_ordinal.items()}
@@ -547,11 +437,11 @@ class _DimFlattener(object):
 
     def __call__(self, dim, indices):
         """
-        Converts a batched dim + batch indices to a flattened dim.
+        Converts a plate dim + plate indices to a unrolled dim.
 
-        :param str dim: a batched dimension to flatten
-        :param dict indices: a mapping from batch dimension to int
-        :return: a flattened dim
+        :param str dim: a plate dimension to unroll
+        :param dict indices: a mapping from plate dimension to int
+        :return: a unrolled dim
         :rtype: str
         """
         plate = self._plates.get(dim, ())
@@ -566,7 +456,7 @@ class _DimFlattener(object):
 
 def naive_ubersum(equation, *operands, **kwargs):
     """
-    Naive reference implementation of :func:`ubersum`.
+    Naive reference implementation of :func:`ubersum` via unrolling.
 
     This implementation should never raise ``NotImplementedError``.
     This implementation should agree with :func:`ubersum` whenver
@@ -580,11 +470,12 @@ def naive_ubersum(equation, *operands, **kwargs):
                      for output in outputs)
     output, = outputs
     inputs = inputs.split(',')
+    backend = kwargs.pop('backend', 'pyro.ops.einsum.torch_log')
 
-    # Split dims into batch dims, contraction dims, and dims to keep.
-    batch_dims = set(kwargs.pop('batch_dims', ''))
-    if not batch_dims:
-        result = opt_einsum.contract(equation, *operands, backend='pyro.ops.einsum.torch_log')
+    # Split dims into plate dims, contraction dims, and dims to keep.
+    plates = set(kwargs.pop('plates', ''))
+    if not plates:
+        result = opt_einsum.contract(equation, *operands, backend=backend)
         return (result,)
     output_dims = set(output)
 
@@ -597,41 +488,40 @@ def naive_ubersum(equation, *operands, **kwargs):
                 raise ValueError(u"Dimension size mismatch at dim '{}': {} vs {}"
                                  .format(dim, size, old))
 
-    # Compute batch context for each non-batch dim, by convention the
-    # intersection over all batch contexts of tensors in which the dim appears.
+    # Compute plate context for each non-plate dim, by convention the
+    # intersection over all plate contexts of tensors in which the dim appears.
     dim_to_ordinal = {}
     for dims in map(set, inputs):
-        ordinal = dims & batch_dims
-        for dim in dims - batch_dims:
+        ordinal = dims & plates
+        for dim in dims - plates:
             dim_to_ordinal[dim] = dim_to_ordinal.get(dim, ordinal) & ordinal
-    for dim in output_dims - batch_dims:
-        missing_dims = dim_to_ordinal[dim] - output_dims
-        if missing_dims:
-            raise ValueError(u"It is nonsensical to preserve a batched dim without preserving "
-                             u"all of that dim's batch dims, but found '{}' without '{}' in '{}'"
-                             .format(dim, ','.join(missing_dims), equation))
+    for dim in output_dims - plates:
+        _check_plates_are_sensible({dim}, dim_to_ordinal[dim] - output_dims)
 
-    # Flatten by replicating along batch dimensions.
-    flatten_dim = _DimFlattener(dim_to_ordinal)
+    # Unroll by replicating along plate dimensions.
+    unroll_dim = _DimUnroller(dim_to_ordinal)
     flat_inputs = []
     flat_operands = []
     for input_, operand in zip(inputs, operands):
-        local_dims = [d for d in input_ if d in batch_dims]
+        local_dims = [d for d in input_ if d in plates]
         offsets = [input_.index(d) - len(input_) for d in local_dims]
         for index in itertools.product(*(range(sizes[d]) for d in local_dims)):
-            flat_inputs.append(''.join(flatten_dim(d, dict(zip(local_dims, index)))
-                                       for d in input_ if d not in batch_dims))
+            flat_inputs.append(''.join(unroll_dim(d, dict(zip(local_dims, index)))
+                                       for d in input_ if d not in plates))
             flat_operands.append(_select(operand, offsets, index))
 
-    # Defer to unbatched einsum.
-    result = operands[0].new_empty(torch.Size(sizes[d] for d in output))
-    local_dims = [d for d in output if d in batch_dims]
+    # Defer to unplated einsum.
+    result = torch.empty(torch.Size(sizes[d] for d in output),
+                         dtype=operands[0].dtype, device=operands[0].device)
+    local_dims = [d for d in output if d in plates]
     offsets = [output.index(d) - len(output) for d in local_dims]
     for index in itertools.product(*(range(sizes[d]) for d in local_dims)):
-        flat_output = ''.join(flatten_dim(d, dict(zip(local_dims, index)))
-                              for d in output if d not in batch_dims)
+        flat_output = ''.join(unroll_dim(d, dict(zip(local_dims, index)))
+                              for d in output if d not in plates)
         flat_equation = ','.join(flat_inputs) + '->' + flat_output
-        flat_result = opt_einsum.contract(flat_equation, *flat_operands,
-                                          backend='pyro.ops.einsum.torch_log')
+        flat_result = opt_einsum.contract(flat_equation, *flat_operands, backend=backend)
+        if not local_dims:
+            result = flat_result
+            break
         _select(result, offsets, index).copy_(flat_result)
     return (result,)

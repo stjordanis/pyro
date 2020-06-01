@@ -1,6 +1,14 @@
 MCMC
 ----
-.. autoclass:: pyro.infer.mcmc.MCMC
+
+.. autoclass:: pyro.infer.mcmc.api.MCMC
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+MCMCKernel
+----------
+.. autoclass:: pyro.infer.mcmc.mcmc_kernel.MCMCKernel
     :members:
     :undoc-members:
     :show-inheritance:
@@ -20,3 +28,18 @@ NUTS
     :members:
     :undoc-members:
     :show-inheritance:
+
+BlockMassMatrix
+---------------
+
+.. autoclass:: pyro.infer.mcmc.BlockMassMatrix
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Utilities
+---------
+
+.. autofunction:: pyro.infer.mcmc.util.initialize_model
+
+.. autofunction:: pyro.infer.mcmc.util.diagnostics

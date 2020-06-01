@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import itertools
 
@@ -7,7 +8,6 @@ import torch
 
 from pyro.infer.util import torch_exp
 from pyro.ops.einsum import contract
-from pyro.ops.sumproduct import logsumproductexp, sumproduct
 from tests.common import assert_equal
 
 
@@ -35,37 +35,17 @@ from tests.common import assert_equal
     'ab,bc,cd->bc',
     'a,a,ab,b,b,b,b->a',
 ])
-def test_einsum(equation, min_size):
+@pytest.mark.parametrize('infinite', [False, True], ids=['finite', 'infinite'])
+def test_einsum(equation, min_size, infinite):
     inputs, output = equation.split('->')
     inputs = inputs.split(',')
     symbols = sorted(set(equation) - set(',->'))
     sizes = dict(zip(symbols, itertools.count(min_size)))
     shapes = [torch.Size(tuple(sizes[dim] for dim in dims))
               for dims in inputs]
-    operands = [torch.randn(shape) for shape in shapes]
+    operands = [torch.full(shape, -float('inf')) if infinite else torch.randn(shape)
+                for shape in shapes]
 
     expected = contract(equation, *(torch_exp(x) for x in operands), backend='torch').log()
     actual = contract(equation, *operands, backend='pyro.ops.einsum.torch_log')
-    assert_equal(actual, expected)
-
-
-@pytest.mark.parametrize('shapes', [
-    ((), (1,), (1, 2)),
-    ((), (2,)),
-    ((1,), (1, 2)),
-    ((1,), (2,)),
-    ((2, 1), (1, 3)),
-    ((2, 1), (2, 3)),
-    ((2, 3), (2, 3)),
-    ((3,), (2, 3)),
-    ((4, 1, 1), None, (), (2, 3)),
-    ((4, 1, 1), None, None, (2, 3)),
-    (None, (1,), (1, 2)),
-    (None, (2,)),
-])
-def test_logsumproductexp(shapes):
-    factors = [float(torch.randn(torch.Size())) if shape is None else torch.randn(shape)
-               for shape in shapes]
-    expected = sumproduct([torch_exp(x) for x in factors]).log()
-    actual = logsumproductexp(factors)
     assert_equal(actual, expected)

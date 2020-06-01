@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 
@@ -52,7 +53,7 @@ def local_guide(latent, k):
 
 def main(args):
     pyro.set_rng_seed(0)
-    pyro.enable_validation()
+    pyro.enable_validation(__debug__)
 
     optim = Adam({"lr": 0.1})
     elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
@@ -69,11 +70,12 @@ def main(args):
         loss += inference.step(data, k=k)
 
     print('Parameters:')
-    for name in sorted(pyro.get_param_store().get_all_param_names()):
-        print('{} = {}'.format(name, pyro.param(name).detach().cpu().numpy()))
+    for name, value in sorted(pyro.get_param_store().items()):
+        print('{} = {}'.format(name, value.detach().cpu().numpy()))
 
 
 if __name__ == '__main__':
+    assert pyro.__version__.startswith('1.3.1')
     parser = argparse.ArgumentParser(description="parse args")
     parser.add_argument('-n', '--num-epochs', default=200, type=int)
     parser.add_argument('--jit', action='store_true')

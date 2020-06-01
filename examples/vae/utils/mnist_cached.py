@@ -1,3 +1,6 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 import errno
 import os
 from functools import reduce
@@ -6,6 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
+
+from pyro.contrib.examples.util import get_data_directory
 
 # This file contains utilities for caching, transforming and splitting MNIST data
 # efficiently. By default, a PyTorch DataLoader will apply the transform every epoch
@@ -127,7 +132,7 @@ class MNISTCached(MNIST):
     test_size = 10000
 
     def __init__(self, mode, sup_num, use_cuda=True, *args, **kwargs):
-        super(MNISTCached, self).__init__(train=mode in ["sup", "unsup", "valid"], *args, **kwargs)
+        super().__init__(train=mode in ["sup", "unsup", "valid"], *args, **kwargs)
 
         # transformations on MNIST data (normalization and one-hot conversion for labels)
         def transform(x):
@@ -144,38 +149,38 @@ class MNISTCached(MNIST):
 
             # transform the training data if transformations are provided
             if transform is not None:
-                self.train_data = (transform(self.train_data.float()))
+                self.data = (transform(self.data.float()))
             if target_transform is not None:
-                self.train_labels = (target_transform(self.train_labels))
+                self.targets = (target_transform(self.targets))
 
             if MNISTCached.train_data_sup is None:
                 if sup_num is None:
                     assert mode == "unsup"
                     MNISTCached.train_data_unsup, MNISTCached.train_labels_unsup = \
-                        self.train_data, self.train_labels
+                        self.data, self.targets
                 else:
                     MNISTCached.train_data_sup, MNISTCached.train_labels_sup, \
                         MNISTCached.train_data_unsup, MNISTCached.train_labels_unsup, \
                         MNISTCached.data_valid, MNISTCached.labels_valid = \
-                        split_sup_unsup_valid(self.train_data, self.train_labels, sup_num)
+                        split_sup_unsup_valid(self.data, self.targets, sup_num)
 
             if mode == "sup":
-                self.train_data, self.train_labels = MNISTCached.train_data_sup, MNISTCached.train_labels_sup
+                self.data, self.targets = MNISTCached.train_data_sup, MNISTCached.train_labels_sup
             elif mode == "unsup":
-                self.train_data = MNISTCached.train_data_unsup
+                self.data = MNISTCached.train_data_unsup
 
                 # making sure that the unsupervised labels are not available to inference
-                self.train_labels = (torch.Tensor(
+                self.targets = (torch.Tensor(
                     MNISTCached.train_labels_unsup.shape[0]).view(-1, 1)) * np.nan
             else:
-                self.train_data, self.train_labels = MNISTCached.data_valid, MNISTCached.labels_valid
+                self.data, self.targets = MNISTCached.data_valid, MNISTCached.labels_valid
 
         else:
             # transform the testing data if transformations are provided
             if transform is not None:
-                self.test_data = (transform(self.test_data.float()))
+                self.data = (transform(self.data.float()))
             if target_transform is not None:
-                self.test_labels = (target_transform(self.test_labels))
+                self.targets = (target_transform(self.targets))
 
     def __getitem__(self, index):
         """
@@ -183,28 +188,29 @@ class MNISTCached(MNIST):
         :returns tuple: (image, target) where target is index of the target class.
         """
         if self.mode in ["sup", "unsup", "valid"]:
-            img, target = self.train_data[index], self.train_labels[index]
+            img, target = self.data[index], self.targets[index]
         elif self.mode == "test":
-            img, target = self.test_data[index], self.test_labels[index]
+            img, target = self.data[index], self.targets[index]
         else:
             assert False, "invalid mode: {}".format(self.mode)
         return img, target
 
 
-def setup_data_loaders(dataset, use_cuda, batch_size, sup_num=None, root='./data', download=True, **kwargs):
+def setup_data_loaders(dataset, use_cuda, batch_size, sup_num=None, root=None, download=True, **kwargs):
     """
         helper function for setting up pytorch data loaders for a semi-supervised dataset
     :param dataset: the data to use
     :param use_cuda: use GPU(s) for training
     :param batch_size: size of a batch of data to output when iterating over the data loaders
     :param sup_num: number of supervised data examples
-    :param root: where on the filesystem should the dataset be
     :param download: download the dataset (if it doesn't exist already)
     :param kwargs: other params for the pytorch data loader
     :return: three data loaders: (supervised data for training, un-supervised data for training,
                                   supervised data for testing)
     """
     # instantiate the dataset as training/testing sets
+    if root is None:
+        root = get_data_directory(__file__)
     if 'num_workers' not in kwargs:
         kwargs = {'num_workers': 0, 'pin_memory': False}
 

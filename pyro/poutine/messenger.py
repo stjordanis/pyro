@@ -1,9 +1,28 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+from functools import partial
 
 from .runtime import _PYRO_STACK
 
 
-class Messenger(object):
+def _context_wrap(context, fn, *args, **kwargs):
+    with context:
+        return fn(*args, **kwargs)
+
+
+class _bound_partial(partial):
+    """
+    Converts a (possibly) bound method into a partial function to
+    support class methods as arguments to handlers.
+    """
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return partial(self.func, instance)
+
+
+class Messenger:
     """
     Context manager class that modifies behavior
     and adds side effects to stochastic functions
@@ -22,11 +41,8 @@ class Messenger(object):
         pass
 
     def __call__(self, fn):
-        def _wraps(*args, **kwargs):
-            with self:
-                return fn(*args, **kwargs)
-        _wraps.msngr = self
-        return _wraps
+        wraps = _bound_partial(partial(_context_wrap, self, fn))
+        return wraps
 
     def __enter__(self):
         """
@@ -37,7 +53,7 @@ class Messenger(object):
 
         Can be overloaded to add any additional per-call setup functionality,
         but the derived class must always push itself onto the stack, usually
-        by calling super(Derived, self).__enter__().
+        by calling super().__enter__().
 
         Derived versions cannot be overridden to take arguments
         and must always return self.
@@ -45,7 +61,7 @@ class Messenger(object):
         if not (self in _PYRO_STACK):
             # if this poutine is not already installed,
             # put it on the bottom of the stack.
-            _PYRO_STACK.insert(0, self)
+            _PYRO_STACK.append(self)
 
             # necessary to return self because the return value of __enter__
             # is bound to VAR in with EXPR as VAR.
@@ -74,7 +90,7 @@ class Messenger(object):
 
         Can be overloaded by derived classes to add any other per-call teardown functionality,
         but the stack must always be popped by the derived class,
-        usually by calling super(Derived, self).__exit__(*args).
+        usually by calling super().__exit__(*args).
 
         Derived versions cannot be overridden to take other arguments,
         and must always return None or False.
@@ -88,8 +104,8 @@ class Messenger(object):
             # this poutine should be on the bottom of the stack.
             # If so, remove it from the stack.
             # if not, raise a ValueError because something really weird happened.
-            if _PYRO_STACK[0] == self:
-                _PYRO_STACK.pop(0)
+            if _PYRO_STACK[-1] == self:
+                _PYRO_STACK.pop()
             else:
                 # should never get here, but just in case...
                 raise ValueError("This Messenger is not on the bottom of the stack")
@@ -100,8 +116,8 @@ class Messenger(object):
             # then remove it and everything below it in the stack.
             if self in _PYRO_STACK:
                 loc = _PYRO_STACK.index(self)
-                for i in range(0, loc + 1):
-                    _PYRO_STACK.pop(0)
+                for i in range(loc, len(_PYRO_STACK)):
+                    _PYRO_STACK.pop()
 
     def _reset(self):
         pass
@@ -114,13 +130,70 @@ class Messenger(object):
         Process the message by calling appropriate method of itself based
         on message type. The message is updated in place.
         """
-        return getattr(self, "_pyro_{}".format(msg["type"]))(msg)
+        method_name = "_pyro_{}".format(msg["type"])
+        if hasattr(self, method_name):
+            return getattr(self, method_name)(msg)
+        return None
 
     def _postprocess_message(self, msg):
+        method_name = "_pyro_post_{}".format(msg["type"])
+        if hasattr(self, method_name):
+            return getattr(self, method_name)(msg)
         return None
 
-    def _pyro_sample(self, msg):
-        return None
+    @classmethod
+    def register(cls, fn=None, type=None, post=None):
+        """
+        :param fn: function implementing operation
+        :param str type: name of the operation
+            (also passed to :func:`~pyro.poutine.runtime.effectful`)
+        :param bool post: if `True`, use this operation as postprocess
 
-    def _pyro_param(self, msg):
-        return None
+        Dynamically add operations to an effect.
+        Useful for generating wrappers for libraries.
+
+        Example::
+
+            @SomeMessengerClass.register
+            def some_function(msg)
+                ...do_something...
+                return msg
+
+        """
+        if fn is None:
+            return lambda x: cls.register(x, type=type, post=post)
+
+        if type is None:
+            raise ValueError("An operation type name must be provided")
+
+        setattr(cls, "_pyro_" + ("post_" if post else "") + type, staticmethod(fn))
+        return fn
+
+    @classmethod
+    def unregister(cls, fn=None, type=None):
+        """
+        :param fn: function implementing operation
+        :param str type: name of the operation
+            (also passed to :func:`~pyro.poutine.runtime.effectful`)
+
+        Dynamically remove operations from an effect.
+        Useful for removing wrappers from libraries.
+
+        Example::
+
+            SomeMessengerClass.unregister(some_function, "name")
+        """
+        if type is None:
+            raise ValueError("An operation type name must be provided")
+
+        try:
+            delattr(cls, "_pyro_post_" + type)
+        except AttributeError:
+            pass
+
+        try:
+            delattr(cls, "_pyro_" + type)
+        except AttributeError:
+            pass
+
+        return fn

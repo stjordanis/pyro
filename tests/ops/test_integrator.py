@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import logging
 from collections import namedtuple
@@ -43,8 +44,10 @@ def register_model(init_args):
         prec=1e-4
     )
 ])
-class HarmonicOscillator(object):
-    inverse_mass_matrix = torch.tensor([1.])
+class HarmonicOscillator:
+    @staticmethod
+    def kinetic_grad(p):
+        return p
 
     @staticmethod
     def energy(q, p):
@@ -66,8 +69,10 @@ class HarmonicOscillator(object):
         prec=5.0e-3
     )
 ])
-class CircularPlanetaryMotion(object):
-    inverse_mass_matrix = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+class CircularPlanetaryMotion:
+    @staticmethod
+    def kinetic_grad(p):
+        return p
 
     @staticmethod
     def energy(q, p):
@@ -90,8 +95,10 @@ class CircularPlanetaryMotion(object):
         prec=1.0e-4
     )
 ])
-class QuarticOscillator(object):
-    inverse_mass_matrix = torch.tensor([[1.]])
+class QuarticOscillator:
+    @staticmethod
+    def kinetic_grad(p):
+        return p
 
     @staticmethod
     def energy(q, p):
@@ -105,12 +112,12 @@ class QuarticOscillator(object):
 @pytest.mark.parametrize('example', TEST_EXAMPLES, ids=EXAMPLE_IDS)
 def test_trajectory(example):
     model, args = example
-    q_f, p_f = velocity_verlet(args.q_i,
-                               args.p_i,
-                               model.potential_fn,
-                               model.inverse_mass_matrix,
-                               args.step_size,
-                               args.num_steps)
+    q_f, p_f, _, _ = velocity_verlet(args.q_i,
+                                     args.p_i,
+                                     model.potential_fn,
+                                     model.kinetic_grad,
+                                     args.step_size,
+                                     args.num_steps)
     logger.info("initial q: {}".format(args.q_i))
     logger.info("final q: {}".format(q_f))
     assert_equal(q_f, args.q_f, args.prec)
@@ -120,12 +127,12 @@ def test_trajectory(example):
 @pytest.mark.parametrize('example', TEST_EXAMPLES, ids=EXAMPLE_IDS)
 def test_energy_conservation(example):
     model, args = example
-    q_f, p_f = velocity_verlet(args.q_i,
-                               args.p_i,
-                               model.potential_fn,
-                               model.inverse_mass_matrix,
-                               args.step_size,
-                               args.num_steps)
+    q_f, p_f, _, _ = velocity_verlet(args.q_i,
+                                     args.p_i,
+                                     model.potential_fn,
+                                     model.kinetic_grad,
+                                     args.step_size,
+                                     args.num_steps)
     energy_initial = model.energy(args.q_i, args.p_i)
     energy_final = model.energy(q_f, p_f)
     logger.info("initial energy: {}".format(energy_initial.item()))
@@ -136,17 +143,17 @@ def test_energy_conservation(example):
 @pytest.mark.parametrize('example', TEST_EXAMPLES, ids=EXAMPLE_IDS)
 def test_time_reversibility(example):
     model, args = example
-    q_forward, p_forward = velocity_verlet(args.q_i,
-                                           args.p_i,
-                                           model.potential_fn,
-                                           model.inverse_mass_matrix,
-                                           args.step_size,
-                                           args.num_steps)
+    q_forward, p_forward, _, _ = velocity_verlet(args.q_i,
+                                                 args.p_i,
+                                                 model.potential_fn,
+                                                 model.kinetic_grad,
+                                                 args.step_size,
+                                                 args.num_steps)
     p_reverse = {key: -val for key, val in p_forward.items()}
-    q_f, p_f = velocity_verlet(q_forward,
-                               p_reverse,
-                               model.potential_fn,
-                               model.inverse_mass_matrix,
-                               args.step_size,
-                               args.num_steps)
+    q_f, p_f, _, _ = velocity_verlet(q_forward,
+                                     p_reverse,
+                                     model.potential_fn,
+                                     model.kinetic_grad,
+                                     args.step_size,
+                                     args.num_steps)
     assert_equal(q_f, args.q_i, 1e-5)

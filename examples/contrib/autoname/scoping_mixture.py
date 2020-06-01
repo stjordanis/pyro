@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 import torch
@@ -49,7 +50,7 @@ def main(args):
 
     data = torch.tensor([0.0, 1.0, 2.0, 20.0, 30.0, 40.0])
     optim = pyro.optim.Adam({'lr': 0.1})
-    inference = SVI(model, config_enumerate(guide, 'parallel'), optim,
+    inference = SVI(model, config_enumerate(guide), optim,
                     loss=TraceEnum_ELBO(max_plate_nesting=1))
 
     print('Step\tLoss')
@@ -61,11 +62,12 @@ def main(args):
         loss += inference.step(K, data)
 
     print('Parameters:')
-    for name in sorted(pyro.get_param_store().get_all_param_names()):
-        print('{} = {}'.format(name, pyro.param(name).detach().cpu().numpy()))
+    for name, value in sorted(pyro.get_param_store().items()):
+        print('{} = {}'.format(name, value.detach().cpu().numpy()))
 
 
 if __name__ == "__main__":
+    assert pyro.__version__.startswith('1.3.1')
     parser = argparse.ArgumentParser(description="parse args")
     parser.add_argument('-n', '--num-epochs', default=200, type=int)
     args = parser.parse_args()

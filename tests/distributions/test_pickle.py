@@ -1,9 +1,11 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import io
 
 import pytest
-import six.moves.cPickle as pickle
+import pickle
 import torch
 
 import pyro.distributions as dist
@@ -38,7 +40,7 @@ ARGS = {
     dist.Geometric: [0.5],
     dist.Independent: [dist.Normal(torch.zeros(2), torch.ones(2)), 1],
     dist.LowRankMultivariateNormal: [torch.zeros(2), torch.ones(2, 2), torch.ones(2)],
-    dist.MaskedMixture: [torch.tensor([1, 0]).byte(), dist.Normal(0, 1), dist.Normal(0, 2)],
+    dist.MaskedMixture: [torch.tensor([1, 0]).bool(), dist.Normal(0, 1), dist.Normal(0, 2)],
     dist.MixtureOfDiagNormals: [torch.ones(2, 3), torch.ones(2, 3), torch.ones(2)],
     dist.MixtureOfDiagNormalsSharedCovariance: [torch.ones(2, 3), torch.ones(3), torch.ones(2)],
     dist.Multinomial: [2, torch.ones(2)],
@@ -72,9 +74,11 @@ def test_pickle(Dist):
     try:
         dist = Dist(*args)
     except Exception:
-        pytest.skip(reason='cannot construct distribution')
+        pytest.skip(msg='cannot construct distribution')
 
+    buffer = io.BytesIO()
     # Note that pickling torch.Size() requires protocol >= 2
-    serialized = pickle.dumps(dist, pickle.HIGHEST_PROTOCOL)
-    deserialized = pickle.loads(serialized)
+    torch.save(dist, buffer, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+    buffer.seek(0)
+    deserialized = torch.load(buffer)
     assert isinstance(deserialized, Dist)

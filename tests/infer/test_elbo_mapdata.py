@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import logging
 
@@ -16,9 +17,12 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.stage("integration", "integration_batch_1")
 @pytest.mark.init(rng_seed=161)
-@pytest.mark.parametrize("batch_size", [3, 8, None])
-@pytest.mark.parametrize("map_type", ["plate", "irange", "range"])
-def test_elbo_mapdata(batch_size, map_type):
+@pytest.mark.parametrize("map_type,batch_size,n_steps,lr",  [("iplate", 3, 7000, 0.0008), ("iplate", 8, 100, 0.018),
+                                                             ("iplate", None, 100, 0.013), ("range", 3, 100, 0.018),
+                                                             ("range", 8, 100, 0.01), ("range", None, 100, 0.011),
+                                                             ("plate", 3, 7000, 0.0008), ("plate", 8, 7000, 0.0008),
+                                                             ("plate", None, 7000, 0.0008)])
+def test_elbo_mapdata(map_type, batch_size, n_steps, lr):
     # normal-normal: known covariance
     lam0 = torch.tensor([0.1, 0.1])   # precision of prior
     loc0 = torch.tensor([0.0, 0.5])   # prior mean
@@ -46,27 +50,26 @@ def test_elbo_mapdata(batch_size, map_type):
     analytic_log_sig_n = -0.5 * torch.log(analytic_lam_n)
     analytic_loc_n = sum_data * (lam / analytic_lam_n) +\
         loc0 * (lam0 / analytic_lam_n)
-    n_steps = 7000
 
     logger.debug("DOING ELBO TEST [bs = {}, map_type = {}]".format(batch_size, map_type))
     pyro.clear_param_store()
 
     def model():
         loc_latent = pyro.sample("loc_latent",
-                                 dist.Normal(loc0, torch.pow(lam0, -0.5)).independent(1))
-        if map_type == "irange":
-            for i in pyro.irange("aaa", len(data), batch_size):
-                pyro.sample("obs_%d" % i, dist.Normal(loc_latent, torch.pow(lam, -0.5)) .independent(1),
+                                 dist.Normal(loc0, torch.pow(lam0, -0.5)).to_event(1))
+        if map_type == "iplate":
+            for i in pyro.plate("aaa", len(data), batch_size):
+                pyro.sample("obs_%d" % i, dist.Normal(loc_latent, torch.pow(lam, -0.5)) .to_event(1),
                             obs=data[i]),
         elif map_type == "plate":
             with pyro.plate("aaa", len(data), batch_size) as ind:
-                pyro.sample("obs", dist.Normal(loc_latent, torch.pow(lam, -0.5)) .independent(1),
+                pyro.sample("obs", dist.Normal(loc_latent, torch.pow(lam, -0.5)) .to_event(1),
                             obs=data[ind]),
         else:
             for i, x in enumerate(data):
                 pyro.sample('obs_%d' % i,
                             dist.Normal(loc_latent, torch.pow(lam, -0.5))
-                            .independent(1),
+                            .to_event(1),
                             obs=x)
         return loc_latent
 
@@ -74,9 +77,9 @@ def test_elbo_mapdata(batch_size, map_type):
         loc_q = pyro.param("loc_q", analytic_loc_n.detach().clone() + torch.tensor([-0.18, 0.23]))
         log_sig_q = pyro.param("log_sig_q", analytic_log_sig_n.detach().clone() - torch.tensor([-0.18, 0.23]))
         sig_q = torch.exp(log_sig_q)
-        pyro.sample("loc_latent", dist.Normal(loc_q, sig_q).independent(1))
-        if map_type == "irange" or map_type is None:
-            for i in pyro.irange("aaa", len(data), batch_size):
+        pyro.sample("loc_latent", dist.Normal(loc_q, sig_q).to_event(1))
+        if map_type == "iplate" or map_type is None:
+            for i in pyro.plate("aaa", len(data), batch_size):
                 pass
         elif map_type == "plate":
             # dummy plate to do subsampling for observe
@@ -85,7 +88,7 @@ def test_elbo_mapdata(batch_size, map_type):
         else:
             pass
 
-    adam = optim.Adam({"lr": 0.0008, "betas": (0.95, 0.999)})
+    adam = optim.Adam({"lr": lr})
     svi = SVI(model, guide, adam, loss=TraceGraph_ELBO())
 
     for k in range(n_steps):

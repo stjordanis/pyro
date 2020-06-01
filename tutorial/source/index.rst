@@ -16,6 +16,18 @@ Welcome to Pyro Examples and Tutorials!
    svi_part_ii
    svi_part_iii
    tensor_shapes
+   mle_map
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Advanced:
+
+   enumeration
+   custom_objectives
+   jit
+   minipyro
+   effect_handlers
+   modules
 
 .. toctree::
    :maxdepth: 2
@@ -23,9 +35,11 @@ Welcome to Pyro Examples and Tutorials!
 
    vae
    bayesian_regression
+   bayesian_regression_ii
    dmm
    air
    ss-vae
+   stable
 
 .. toctree::
    :maxdepth: 2
@@ -33,12 +47,39 @@ Welcome to Pyro Examples and Tutorials!
 
    gmm
    gp
+   gplvm
    bo
+   easyguide
+   forecasting_i
+   forecasting_ii
+   forecasting_iii
    tracking_1d
+   csis
    RSA-implicature
    RSA-hyperbole
    ekf
+   working_memory
+   elections
+   dirichlet_process_mixture
+   boosting_bbvi	
 
+.. toctree::
+   :maxdepth: 2
+   :caption: Code Examples:
+
+   capture_recapture
+   cevae
+   hmm
+   lda
+   mcmc
+   neutra
+   sparse_gamma
+   dkl
+   einsum
+   forecast_simple
+   timeseries
+   smcfilter
+   sir_hmc
 
 Indices and tables
 ==================

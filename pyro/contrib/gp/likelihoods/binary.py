@@ -1,11 +1,12 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 
 import pyro
 import pyro.distributions as dist
 
-from .likelihood import Likelihood
+from pyro.contrib.gp.likelihoods.likelihood import Likelihood
 
 
 class Binary(Likelihood):
@@ -20,10 +21,9 @@ class Binary(Likelihood):
     :param callable response_function: A mapping to correct domain for Binary
         likelihood.
     """
-    def __init__(self, response_function=None, name="Binary"):
-        super(Binary, self).__init__(name)
-        self.response_function = (response_function if response_function is not None
-                                  else torch.sigmoid)
+    def __init__(self, response_function=None):
+        super().__init__()
+        self.response_function = torch.sigmoid if response_function is None else response_function
 
     def forward(self, f_loc, f_var, y=None):
         r"""
@@ -42,10 +42,12 @@ class Binary(Likelihood):
         :rtype: torch.Tensor
         """
         # calculates Monte Carlo estimate for E_q(f) [logp(y | f)]
-        f = dist.Normal(f_loc, f_var)()
-        f_res = self.response_function(f)
-
-        y_dist = dist.Bernoulli(f_res)
+        f = dist.Normal(f_loc, f_var.sqrt())()
+        if self.response_function is torch.sigmoid:
+            y_dist = dist.Bernoulli(logits=f)
+        else:
+            f_res = self.response_function(f)
+            y_dist = dist.Bernoulli(f_res)
         if y is not None:
-            y_dist = y_dist.expand_by(y.shape[:-f_res.dim()]).independent(y.dim())
-        return pyro.sample(self.y_name, y_dist, obs=y)
+            y_dist = y_dist.expand_by(y.shape[:-f.dim()]).to_event(y.dim())
+        return pyro.sample(self._pyro_get_fullname("y"), y_dist, obs=y)

@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 from functools import partial
@@ -9,9 +10,9 @@ import numpy as np
 import pyro
 from pyro import optim
 from pyro.infer import TraceEnum_ELBO
-from pyro.contrib.oed.eig import vi_ape
+from pyro.contrib.oed.eig import vi_eig
 import pyro.contrib.gp as gp
-from pyro.contrib.glmm import (
+from pyro.contrib.oed.glmm import (
     zero_mean_unit_obs_sd_lm, group_assignment_matrix, analytic_posterior_cov
 )
 
@@ -29,7 +30,7 @@ allocation of participants to the two groups to maximise the expected gain in
 information from actually performing the experiment.
 
 For details of the implementation of average posterior entropy estimation, see
-the docs for :func:`pyro.contrib.oed.eig.vi_ape`.
+the docs for :func:`pyro.contrib.oed.eig.vi_eig`.
 
 We recommend the technical report from Long Ouyang et al [2] as an introduction
 to optimal experiment design within probabilistic programs.
@@ -57,7 +58,7 @@ model, guide = zero_mean_unit_obs_sd_lm(prior_sds)
 def estimated_ape(ns, num_vi_steps):
     designs = [group_assignment_matrix(torch.tensor([n1, N-n1])) for n1 in ns]
     X = torch.stack(designs)
-    est_ape = vi_ape(
+    est_ape = vi_eig(
         model,
         X,
         observation_labels="y",
@@ -67,7 +68,8 @@ def estimated_ape(ns, num_vi_steps):
             "optim": optim.Adam({"lr": 0.05}),
             "loss": TraceEnum_ELBO(strict_enumeration_warning=False).differentiable_loss,
             "num_steps": num_vi_steps},
-        is_parameters={"num_samples": 1}
+        is_parameters={"num_samples": 1},
+        eig=False
     )
     return est_ape
 
@@ -84,9 +86,9 @@ def true_ape(ns):
     return torch.tensor(true_ape)
 
 
-def main(num_vi_steps, num_bo_steps):
+def main(num_vi_steps, num_bo_steps, seed):
 
-    pyro.set_rng_seed(42)
+    pyro.set_rng_seed(seed)
     pyro.clear_param_store()
 
     est_ape = partial(estimated_ape, num_vi_steps=num_vi_steps)
@@ -102,7 +104,6 @@ def main(num_vi_steps, num_bo_steps):
         gpmodel = gp.models.GPRegression(
             X, y, gp.kernels.Matern52(input_dim=1, lengthscale=torch.tensor(10.)),
             noise=torch.tensor(noise), jitter=1e-6)
-        gpmodel.optimize(loss=TraceEnum_ELBO(strict_enumeration_warning=False).differentiable_loss)
         gpbo = GPBayesOptimizer(constraints.interval(0, 100), gpmodel,
                                 num_acquisitions=num_acquisitions)
         pyro.clear_param_store()
@@ -114,8 +115,11 @@ def main(num_vi_steps, num_bo_steps):
 
 
 if __name__ == "__main__":
+    assert pyro.__version__.startswith('1.3.1')
     parser = argparse.ArgumentParser(description="A/B test experiment design using VI")
     parser.add_argument("-n", "--num-vi-steps", nargs="?", default=5000, type=int)
     parser.add_argument('--num-bo-steps', nargs="?", default=5, type=int)
+    parser.add_argument('--seed', type=int, default=1, metavar='S',
+                        help='random seed (default: 1)')
     args = parser.parse_args()
-    main(args.num_vi_steps, args.num_bo_steps)
+    main(args.num_vi_steps, args.num_bo_steps, args.seed)

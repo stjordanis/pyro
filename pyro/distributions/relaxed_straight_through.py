@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 
@@ -29,26 +30,22 @@ class RelaxedOneHotCategoricalStraightThrough(RelaxedOneHotCategorical):
     [2] Categorical Reparameterization with Gumbel-Softmax,
         Eric Jang, Shixiang Gu, Ben Poole
     """
-    def __init__(self, temperature, probs=None, logits=None, validate_args=None):
-        super(RelaxedOneHotCategoricalStraightThrough, self).__init__(temperature=temperature, probs=probs,
-                                                                      logits=logits, validate_args=validate_args)
-
     def rsample(self, sample_shape=torch.Size()):
-        soft_sample = super(RelaxedOneHotCategoricalStraightThrough, self).rsample(sample_shape)
+        soft_sample = super().rsample(sample_shape)
         soft_sample = clamp_probs(soft_sample)
         hard_sample = QuantizeCategorical.apply(soft_sample)
         return hard_sample
 
     def log_prob(self, value):
         value = getattr(value, '_unquantize', value)
-        return super(RelaxedOneHotCategoricalStraightThrough, self).log_prob(value)
+        return super().log_prob(value)
 
 
 class QuantizeCategorical(torch.autograd.Function):
     @staticmethod
     def forward(ctx, soft_value):
         argmax = soft_value.max(-1)[1]
-        hard_value = soft_value.new_zeros(soft_value.shape)
+        hard_value = torch.zeros_like(soft_value)
         hard_value._unquantize = soft_value
         if argmax.dim() < hard_value.dim():
             argmax = argmax.unsqueeze(-1)
@@ -81,19 +78,15 @@ class RelaxedBernoulliStraightThrough(RelaxedBernoulli):
     [2] Categorical Reparameterization with Gumbel-Softmax,
         Eric Jang, Shixiang Gu, Ben Poole
     """
-    def __init__(self, temperature, probs=None, logits=None, validate_args=None):
-        super(RelaxedBernoulliStraightThrough, self).__init__(temperature=temperature, probs=probs,
-                                                              logits=logits, validate_args=validate_args)
-
     def rsample(self, sample_shape=torch.Size()):
-        soft_sample = super(RelaxedBernoulliStraightThrough, self).rsample(sample_shape)
+        soft_sample = super().rsample(sample_shape)
         soft_sample = clamp_probs(soft_sample)
         hard_sample = QuantizeBernoulli.apply(soft_sample)
         return hard_sample
 
     def log_prob(self, value):
         value = getattr(value, '_unquantize', value)
-        return super(RelaxedBernoulliStraightThrough, self).log_prob(value)
+        return super().log_prob(value)
 
 
 class QuantizeBernoulli(torch.autograd.Function):

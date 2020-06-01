@@ -1,20 +1,31 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+import functools
+import weakref
 
 import torch
 
+assert torch.__version__.startswith('1.')
 
-def _patch(target):
+
+def patch_dependency(target, root_module=torch):
     parts = target.split('.')
-    assert parts[0] == 'torch'
-    module = torch
+    assert parts[0] == root_module.__name__
+    module = root_module
     for part in parts[1:-1]:
         module = getattr(module, part)
     name = parts[-1]
-    old_fn = getattr(module, name)
+    old_fn = getattr(module, name, None)
     old_fn = getattr(old_fn, '_pyro_unpatched', old_fn)  # ensure patching is idempotent
 
     def decorator(new_fn):
-        new_fn.__name__ = name
+        try:
+            functools.update_wrapper(new_fn, old_fn)
+        except Exception:
+            for attr in functools.WRAPPER_ASSIGNMENTS:
+                if hasattr(old_fn, attr):
+                    setattr(new_fn, attr, getattr(old_fn, attr))
         new_fn._pyro_unpatched = old_fn
         setattr(module, name, new_fn)
         return new_fn
@@ -22,61 +33,26 @@ def _patch(target):
     return decorator
 
 
-@_patch('torch._standard_gamma')
-def _torch_standard_gamma(concentration):
-    unpatched_fn = _torch_standard_gamma._pyro_unpatched
-    if concentration.is_cuda:
-        return unpatched_fn(concentration.cpu()).cuda(concentration.get_device())
-    return unpatched_fn(concentration)
+# TODO: Move upstream to allow for pickle serialization of transforms
+@patch_dependency('torch.distributions.transforms.Transform.__getstate__')
+def _Transform__getstate__(self):
+    attrs = {}
+    for k, v in self.__dict__.items():
+        if isinstance(v, weakref.ref):
+            attrs[k] = None
+        else:
+            attrs[k] = v
+    return attrs
 
 
-@_patch('torch.distributions.gamma._standard_gamma')
-def _standard_gamma(concentration):
-    if concentration.is_cuda:
-        return concentration.cpu()._standard_gamma().cuda(concentration.get_device())
-    return concentration._standard_gamma()
-
-
-@_patch('torch._dirichlet_grad')
-def _torch_dirichlet_grad(x, concentration, total):
-    unpatched_fn = _torch_dirichlet_grad._pyro_unpatched
-    if x.is_cuda:
-        return unpatched_fn(x.cpu(), concentration.cpu(), total.cpu()).cuda(x.get_device())
-    return unpatched_fn(x, concentration, total)
-
-
-@_patch('torch.linspace')
-def _torch_linspace(*args, **kwargs):
-    unpatched_fn = _torch_linspace._pyro_unpatched
-    template = torch.Tensor()
-    if template.is_cuda:
-        kwargs["device"] = "cpu"
-        ret = unpatched_fn(*args, **kwargs).to(device=template.device)
-        kwargs.pop("device", None)
-    else:
-        ret = unpatched_fn(*args, **kwargs)
-    return ret
-
-
-@_patch('torch.einsum')
-def _einsum(equation, operands):
-    # work around torch.einsum performance issues
-    # see https://github.com/pytorch/pytorch/issues/10661
-    if equation == 'ac,abc->bc':
-        x, y = operands
-        return (x.unsqueeze(1) * y).sum(0)
-    elif equation == 'ac,abc->cb':
-        x, y = operands
-        return (x.unsqueeze(1) * y).sum(0).transpose(0, 1)
-    elif equation == 'abc,ac->cb':
-        y, x = operands
-        return (x.unsqueeze(1) * y).sum(0).transpose(0, 1)
-
-    # this workaround can be deleted after this issue is fixed in release:
-    # https://github.com/pytorch/pytorch/issues/7763
-    operands = [t.clone() for t in operands]
-
-    return _einsum._pyro_unpatched(equation, operands)
+# Fixes a shape error in Multinomial.support with inhomogeneous .total_count
+@patch_dependency('torch.distributions.Multinomial.support')
+@torch.distributions.constraints.dependent_property
+def _Multinomial_support(self):
+    total_count = self.total_count
+    if isinstance(total_count, torch.Tensor):
+        total_count = total_count.unsqueeze(-1)
+    return torch.distributions.constraints.integer_interval(0, total_count)
 
 
 __all__ = []

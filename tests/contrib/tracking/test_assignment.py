@@ -1,4 +1,5 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import pytest
 import torch
@@ -267,7 +268,7 @@ def test_persistent_exact_5_4_3(e1, e2, e3, bp_iters, bp_momentum):
                          [[1, 0, 0], [0, 1, 1], [0, 0, 1], [1, 0, 0]],
                          [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]],
                          [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 1, 0]],
-                         [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1]]], dtype=torch.uint8)
+                         [[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1]]], dtype=torch.bool)
     assign_logits[~mask] = -INF
     expected = MarginalAssignmentPersistent(exists_logits, assign_logits, None)
     actual = MarginalAssignmentPersistent(exists_logits, assign_logits, bp_iters, bp_momentum)
@@ -298,7 +299,7 @@ def test_persistent_independent_subproblems(num_objects, num_frames, num_detecti
 
     # solve a unioned assignment problem
     exists_logits = torch.cat([exists_logits_1, exists_logits_2])
-    assign_logits = torch.empty(num_frames, num_detections * 2, num_objects * 2).fill_(-INF)
+    assign_logits = torch.full((num_frames, num_detections * 2, num_objects * 2), -INF)
     assign_logits[:, :num_detections, :num_objects] = assign_logits_1
     assign_logits[:, num_detections:, num_objects:] = assign_logits_2
     assignment = MarginalAssignmentPersistent(exists_logits, assign_logits, bp_iters)

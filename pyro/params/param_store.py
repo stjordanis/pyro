@@ -1,13 +1,15 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import re
+import warnings
 import weakref
 
 import torch
 from torch.distributions import constraints, transform_to
 
 
-class ParamStoreDict(object):
+class ParamStoreDict:
     """
     Global store for parameters in Pyro. This is basically a key-value store.
     The typical user interacts with the ParamStore primarily through the
@@ -28,6 +30,9 @@ class ParamStoreDict(object):
       two different modules each of which contains a parameter named `weight`. by contrast, a user
       can only have one top-level parameter named `weight` (outside of any module).
     - parameters can be saved and loaded from disk using `save` and `load`.
+    - in general parameters are associated with both *constrained* and *unconstrained* values. for
+      example, under the hood a parameter that is constrained to be positive is represented as an
+      unconstrained tensor in log space.
     """
 
     # -------------------------------------------------------------------------------
@@ -51,7 +56,8 @@ class ParamStoreDict(object):
 
     def items(self):
         """
-        Iterate over ``(name, constrained_param)`` pairs.
+        Iterate over ``(name, constrained_param)`` pairs. Note that `constrained_param` is
+        in the constrained (i.e. user-facing) space.
         """
         for name in self._params:
             yield name, self[name]
@@ -88,14 +94,13 @@ class ParamStoreDict(object):
         """
         Remove a parameter from the param store.
         """
-        constrained_value = self._params.pop(name)
-        unconstrained_value = constrained_value.unconstrained()
+        unconstrained_value = self._params.pop(name)
         self._param_to_name.pop(unconstrained_value)
         self._constraints.pop(name)
 
     def __getitem__(self, name):
         """
-        Get the constrained value of a named parameter.
+        Get the *constrained* value of a named parameter.
         """
         unconstrained_value = self._params[name]
 
@@ -109,7 +114,7 @@ class ParamStoreDict(object):
     def __setitem__(self, name, new_constrained_value):
         """
         Set the constrained value of an existing parameter, or the value of a
-        new unconstrained parameter. To declare a new parameter with
+        new *unconstrained* parameter. To declare a new parameter with
         constraint, use :meth:`setdefault`.
         """
         # store constraint, defaulting to unconstrained
@@ -128,7 +133,7 @@ class ParamStoreDict(object):
 
     def setdefault(self, name, init_constrained_value, constraint=constraints.real):
         """
-        Retrieve a constrained parameter value from the if it exists, otherwise
+        Retrieve a *constrained* parameter value from the if it exists, otherwise
         set the initial value. Note that this is a little fancier than
         :meth:`dict.setdefault`.
 
@@ -143,7 +148,7 @@ class ParamStoreDict(object):
         :param init_constrained_value: initial constrained value
         :type init_constrained_value: torch.Tensor or callable returning a torch.Tensor
         :param constraint: torch constraint object
-        :type constraint: torch.distributions.constraints.Constraint
+        :type constraint: ~torch.distributions.constraints.Constraint
         :returns: constrained parameter value
         :rtype: torch.Tensor
         """
@@ -167,31 +172,23 @@ class ParamStoreDict(object):
     def named_parameters(self):
         """
         Returns an iterator over ``(name, unconstrained_value)`` tuples for
-        each parameter in the ParamStore.
+        each parameter in the ParamStore. Note that, in the event the parameter is constrained,
+        `unconstrained_value` is in the unconstrained space implicitly used by the constraint.
         """
         return self._params.items()
 
     def get_all_param_names(self):
-        """
-        Get all parameter names in the ParamStore
-        """
+        warnings.warn("ParamStore.get_all_param_names() is deprecated; use .keys() instead.",
+                      DeprecationWarning)
         return self.keys()
 
     def replace_param(self, param_name, new_param, old_param):
-        """
-        Replace the param param_name with current value old_param with the new value new_param
-
-        :param param_name: parameter name
-        :type param_name: str
-        :param new_param: the paramater to be put into the ParamStore
-        :type new_param: torch.Tensor
-        :param old_param: the paramater to be removed from the ParamStore
-        :type new_param: torch.Tensor
-        """
+        warnings.warn("ParamStore.replace_param() is deprecated; use .__setitem__() instead.",
+                      DeprecationWarning)
         assert self._params[param_name] is old_param.unconstrained()
         self[param_name] = new_param
 
-    def get_param(self, name, init_tensor=None, constraint=constraints.real):
+    def get_param(self, name, init_tensor=None, constraint=constraints.real, event_dim=None):
         """
         Get parameter from its name. If it does not yet exist in the
         ParamStore, it will be created and stored.
@@ -203,6 +200,7 @@ class ParamStoreDict(object):
         :type init_tensor: torch.Tensor
         :param constraint: torch constraint
         :type constraint: torch.distributions.constraints.Constraint
+        :param int event_dim: (ignored)
         :returns: parameter
         :rtype: torch.Tensor
         """

@@ -1,3 +1,7 @@
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+import io
 import logging
 
 import pytest
@@ -7,10 +11,12 @@ import pyro
 import pyro.distributions as dist
 import pyro.poutine as poutine
 from pyro.infer import config_enumerate
-from pyro.infer.mcmc import HMC, MCMC, NUTS
-from pyro.infer.mcmc.util import TraceTreeEvaluator, TraceEinsumEvaluator
+from pyro.infer.mcmc import HMC, NUTS
+from pyro.infer.mcmc.api import MCMC
+from pyro.infer.mcmc.util import TraceEinsumEvaluator, TraceTreeEvaluator, initialize_model
+from pyro.infer.reparam import LatentStableReparam
 from pyro.poutine.subsample_messenger import _Subsample
-from tests.common import assert_equal, xfail_param
+from tests.common import assert_close, assert_equal, xfail_param
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +47,7 @@ def print_debug_info(model_trace):
     (HMC, {"adapt_step_size": True, "num_steps": 3}),
     (NUTS, {"adapt_step_size": True}),
 ])
-@pytest.mark.parametrize("use_einsum", [False, True])
-def test_model_error_stray_batch_dims(kernel, kwargs, use_einsum):
+def test_model_error_stray_batch_dims(kernel, kwargs):
 
     def gmm():
         data = torch.tensor([0., 0., 3., 3., 3., 5., 5.])
@@ -53,11 +58,11 @@ def test_model_error_stray_batch_dims(kernel, kwargs, use_einsum):
             pyro.sample("obs", dist.Normal(cluster_means[assignments], 1.), obs=data)
         return cluster_means
 
-    mcmc_kernel = kernel(gmm, experimental_use_einsum=use_einsum, **kwargs)
+    mcmc_kernel = kernel(gmm, **kwargs)
     # Error due to non finite value for `max_plate_nesting`.
     assert_error(mcmc_kernel)
     # Error due to batch dims not inside plate.
-    mcmc_kernel = kernel(gmm, max_plate_nesting=1, experimental_use_einsum=use_einsum, **kwargs)
+    mcmc_kernel = kernel(gmm, max_plate_nesting=1, **kwargs)
     assert_error(mcmc_kernel)
 
 
@@ -65,8 +70,7 @@ def test_model_error_stray_batch_dims(kernel, kwargs, use_einsum):
     (HMC, {"adapt_step_size": True, "num_steps": 3}),
     (NUTS, {"adapt_step_size": True}),
 ])
-@pytest.mark.parametrize("use_einsum", [False, True])
-def test_model_error_enum_dim_clash(kernel, kwargs, use_einsum):
+def test_model_error_enum_dim_clash(kernel, kwargs):
 
     def gmm():
         data = torch.tensor([0., 0., 3., 3., 3., 5., 5.])
@@ -78,14 +82,13 @@ def test_model_error_enum_dim_clash(kernel, kwargs, use_einsum):
             pyro.sample("obs", dist.Normal(cluster_means[assignments], 1.), obs=data)
         return cluster_means
 
-    mcmc_kernel = kernel(gmm, max_plate_nesting=0,
-                         experimental_use_einsum=use_einsum, **kwargs)
+    mcmc_kernel = kernel(gmm, max_plate_nesting=0, **kwargs)
     assert_error(mcmc_kernel)
 
 
 def test_log_prob_eval_iterates_in_correct_order():
-    @poutine.enum(first_available_dim=4)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-5)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4)})
     def model():
         outer = pyro.plate("outer", 3, dim=-1)
@@ -126,8 +129,8 @@ def test_log_prob_eval_iterates_in_correct_order():
 def test_all_discrete_sites_log_prob(Eval):
     p = 0.3
 
-    @poutine.enum(first_available_dim=3)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-4)
+    @config_enumerate
     def model():
         d = dist.Bernoulli(p)
         context1 = pyro.plate("outer", 2, dim=-1)
@@ -151,8 +154,8 @@ def test_all_discrete_sites_log_prob(Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator,
                                   xfail_param(TraceEinsumEvaluator, reason="TODO: Debug this failure case.")])
 def test_enumeration_in_tree(Eval):
-    @poutine.enum(first_available_dim=4)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-5)
+    @config_enumerate
     @poutine.condition(data={"sample1": torch.tensor(0.),
                              "sample2": torch.tensor(1.),
                              "sample3": torch.tensor(2.)})
@@ -189,8 +192,8 @@ def test_enumeration_in_tree(Eval):
 def test_enumeration_in_dag(Eval):
     p = 0.3
 
-    @poutine.enum(first_available_dim=2)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-3)
+    @config_enumerate
     @poutine.condition(data={"b": torch.tensor(0.4), "c": torch.tensor(0.4)})
     def model():
         d = dist.Bernoulli(p)
@@ -220,8 +223,8 @@ def test_enumeration_in_dag(Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator, TraceEinsumEvaluator])
 def test_enum_log_prob_continuous_observed(data, expected_log_prob, Eval):
 
-    @poutine.enum(first_available_dim=1)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-2)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4)})
     def model(data):
         p = pyro.sample("p", dist.Uniform(0., 1.))
@@ -249,8 +252,8 @@ def test_enum_log_prob_continuous_observed(data, expected_log_prob, Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator, TraceEinsumEvaluator])
 def test_enum_log_prob_continuous_sampled(data, expected_log_prob, Eval):
 
-    @poutine.enum(first_available_dim=1)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-2)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4),
                              "n": torch.tensor([[1.], [-1.]])})
     def model(data):
@@ -277,8 +280,8 @@ def test_enum_log_prob_continuous_sampled(data, expected_log_prob, Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator, TraceEinsumEvaluator])
 def test_enum_log_prob_discrete_observed(data, expected_log_prob, Eval):
 
-    @poutine.enum(first_available_dim=1)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-2)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4)})
     def model(data):
         p = pyro.sample("p", dist.Uniform(0., 1.))
@@ -303,8 +306,8 @@ def test_enum_log_prob_discrete_observed(data, expected_log_prob, Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator, TraceEinsumEvaluator])
 def test_enum_log_prob_multiple_plate(data, expected_log_prob, Eval):
 
-    @poutine.enum(first_available_dim=1)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-2)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4)})
     def model(data):
         p = pyro.sample("p", dist.Beta(1.1, 1.1))
@@ -332,8 +335,8 @@ def test_enum_log_prob_multiple_plate(data, expected_log_prob, Eval):
 @pytest.mark.parametrize("Eval", [TraceTreeEvaluator, TraceEinsumEvaluator])
 def test_enum_log_prob_nested_plate(data, expected_log_prob, Eval):
 
-    @poutine.enum(first_available_dim=2)
-    @config_enumerate(default="parallel")
+    @poutine.enum(first_available_dim=-3)
+    @config_enumerate
     @poutine.condition(data={"p": torch.tensor(0.4)})
     def model(data):
         p = pyro.sample("p", dist.Uniform(0., 1.))
@@ -352,3 +355,42 @@ def test_enum_log_prob_nested_plate(data, expected_log_prob, Eval):
     assert_equal(trace_prob_evaluator.log_prob(model_trace),
                  expected_log_prob,
                  prec=1e-3)
+
+
+def _beta_bernoulli(data):
+    alpha = torch.tensor([1.1, 1.1])
+    beta = torch.tensor([1.1, 1.1])
+    p_latent = pyro.sample('p_latent', dist.Beta(alpha, beta))
+    with pyro.plate('data', data.shape[0], dim=-2):
+        pyro.sample('obs', dist.Bernoulli(p_latent), obs=data)
+    return p_latent
+
+
+@pytest.mark.parametrize('jit', [False, True])
+def test_potential_fn_pickling(jit):
+    data = dist.Bernoulli(torch.tensor([0.8, 0.2])).sample(sample_shape=(torch.Size((1000,))))
+    _, potential_fn, _, _ = initialize_model(_beta_bernoulli, (data,), jit_compile=jit,
+                                             skip_jit_warnings=True)
+    test_data = {'p_latent': torch.tensor([0.2, 0.6])}
+    buffer = io.BytesIO()
+    torch.save(potential_fn, buffer)
+    buffer.seek(0)
+    deser_potential_fn = torch.load(buffer)
+    assert_close(deser_potential_fn(test_data), potential_fn(test_data))
+
+
+@pytest.mark.parametrize("kernel, kwargs", [
+    (HMC, {"adapt_step_size": True, "num_steps": 3}),
+    (NUTS, {"adapt_step_size": True}),
+])
+def test_reparam_stable(kernel, kwargs):
+
+    @poutine.reparam(config={"z": LatentStableReparam()})
+    def model():
+        stability = pyro.sample("stability", dist.Uniform(0., 2.))
+        skew = pyro.sample("skew", dist.Uniform(-1., 1.))
+        y = pyro.sample("z", dist.Stable(stability, skew))
+        pyro.sample("x", dist.Poisson(y.abs()), obs=torch.tensor(1.))
+
+    mcmc_kernel = kernel(model, max_plate_nesting=0, **kwargs)
+    assert_ok(mcmc_kernel)

@@ -1,11 +1,12 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 import torch
 
 import pyro
 import pyro.distributions as dist
 
-from .likelihood import Likelihood
+from pyro.contrib.gp.likelihoods.likelihood import Likelihood
 
 
 class Poisson(Likelihood):
@@ -19,10 +20,9 @@ class Poisson(Likelihood):
 
     :param callable response_function: A mapping to positive real numbers.
     """
-    def __init__(self, response_function=None, name="Poisson"):
-        super(Poisson, self).__init__(name)
-        self.response_function = (torch.exp if response_function is None
-                                  else response_function)
+    def __init__(self, response_function=None):
+        super().__init__()
+        self.response_function = torch.exp if response_function is None else response_function
 
     def forward(self, f_loc, f_var, y=None):
         r"""
@@ -41,10 +41,10 @@ class Poisson(Likelihood):
         :rtype: torch.Tensor
         """
         # calculates Monte Carlo estimate for E_q(f) [logp(y | f)]
-        f = dist.Normal(f_loc, f_var)()
+        f = dist.Normal(f_loc, f_var.sqrt())()
         f_res = self.response_function(f)
 
         y_dist = dist.Poisson(f_res)
         if y is not None:
-            y_dist = y_dist.expand_by(y.shape[:-f_res.dim()]).independent(y.dim())
-        return pyro.sample(self.y_name, y_dist, obs=y)
+            y_dist = y_dist.expand_by(y.shape[:-f_res.dim()]).to_event(y.dim())
+        return pyro.sample(self._pyro_get_fullname("y"), y_dist, obs=y)

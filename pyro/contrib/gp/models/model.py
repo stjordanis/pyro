@@ -1,8 +1,7 @@
-from __future__ import absolute_import, division, print_function
+# Copyright (c) 2017-2019 Uber Technologies, Inc.
+# SPDX-License-Identifier: Apache-2.0
 
-from pyro.contrib.gp.util import Parameterized
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam, PyroOptim
+from pyro.contrib.gp.parameterized import Parameterized
 
 
 def _zero_mean_function(x):
@@ -10,7 +9,7 @@ def _zero_mean_function(x):
 
 
 class GPModel(Parameterized):
-    """
+    r"""
     Base class for Gaussian Process models.
 
     The core of a Gaussian Process is a covariance function :math:`k` which governs
@@ -39,8 +38,8 @@ class GPModel(Parameterized):
         >>> X = torch.tensor([[1., 5, 3], [4, 3, 7]])
         >>> y = torch.tensor([2., 1])
         >>> kernel = gp.kernels.RBF(input_dim=3)
-        >>> kernel.set_prior("variance", dist.Uniform(torch.tensor(0.5), torch.tensor(1.5)))
-        >>> kernel.set_prior("lengthscale", dist.Uniform(torch.tensor(1.0), torch.tensor(3.0)))
+        >>> kernel.variance = pyro.nn.PyroSample(dist.Uniform(torch.tensor(0.5), torch.tensor(1.5)))
+        >>> kernel.lengthscale = pyro.nn.PyroSample(dist.Uniform(torch.tensor(1.0), torch.tensor(3.0)))
         >>> gpr = gp.models.GPRegression(X, y, kernel)
 
     There are two ways to train a Gaussian Process model:
@@ -49,20 +48,22 @@ class GPModel(Parameterized):
       get posterior samples for the Gaussian Process's parameters. For example:
 
         >>> hmc_kernel = HMC(gpr.model)
-        >>> mcmc_run = MCMC(hmc_kernel, num_samples=10)
-        >>> posterior_ls_trace = []  # store lengthscale trace
-        >>> ls_name = param_with_module_name(gpr.kernel.name, "lengthscale")
-        >>> for trace, _ in mcmc_run._traces():
-        ...     posterior_ls_trace.append(trace.nodes[ls_name]["value"])
+        >>> mcmc = MCMC(hmc_kernel, num_samples=10)
+        >>> mcmc.run()
+        >>> ls_name = "kernel.lengthscale"
+        >>> posterior_ls = mcmc.get_samples()[ls_name]
 
-    + Using a variational inference (e.g. :class:`~pyro.infer.svi.SVI`) on the pair
-      :meth:`model`, :meth:`guide` as in `SVI tutorial
-      <http://pyro.ai/examples/svi_part_i.html>`_:
+    + Using a variational inference on the pair :meth:`model`, :meth:`guide`:
 
-        >>> optimizer = pyro.optim.Adam({"lr": 0.01})
-        >>> svi = SVI(gpr.model, gpr.guide, optimizer, loss=Trace_ELBO())
+        >>> optimizer = torch.optim.Adam(gpr.parameters(), lr=0.01)
+        >>> loss_fn = pyro.infer.TraceMeanField_ELBO().differentiable_loss
+        >>>
         >>> for i in range(1000):
         ...     svi.step()  # doctest: +SKIP
+        ...     optimizer.zero_grad()
+        ...     loss = loss_fn(gpr.model, gpr.guide)  # doctest: +SKIP
+        ...     loss.backward()  # doctest: +SKIP
+        ...     optimizer.step()
 
     To give a prediction on new dataset, simply use :meth:`forward` like any PyTorch
     :class:`torch.nn.Module`:
@@ -85,10 +86,9 @@ class GPModel(Parameterized):
         process. By default, we use zero mean.
     :param float jitter: A small positive term which is added into the diagonal part of
         a covariance matrix to help stablize its Cholesky decomposition.
-    :param str name: Name of this model.
     """
-    def __init__(self, X, y, kernel, mean_function=None, jitter=1e-6, name=None):
-        super(GPModel, self).__init__(name)
+    def __init__(self, X, y, kernel, mean_function=None, jitter=1e-6):
+        super().__init__()
         self.set_data(X, y)
         self.kernel = kernel
         self.mean_function = (mean_function if mean_function is not None else
@@ -142,27 +142,30 @@ class GPModel(Parameterized):
             >>> X = torch.tensor([[1., 5, 3], [4, 3, 7]])
             >>> y = torch.tensor([2., 1])
             >>> kernel = gp.kernels.RBF(input_dim=3)
-            >>> kernel.set_prior("variance", dist.Uniform(torch.tensor(0.5), torch.tensor(1.5)))
-            >>> kernel.set_prior("lengthscale", dist.Uniform(torch.tensor(1.0), torch.tensor(3.0)))
-            >>> optimizer = pyro.optim.Adam({"lr": 0.01})
+            >>> kernel.variance = pyro.nn.PyroSample(dist.Uniform(torch.tensor(0.5), torch.tensor(1.5)))
+            >>> kernel.lengthscale = pyro.nn.PyroSample(dist.Uniform(torch.tensor(1.0), torch.tensor(3.0)))
 
         + Batch training on a sparse variational model:
 
             >>> Xu = torch.tensor([[1., 0, 2]])  # inducing input
             >>> likelihood = gp.likelihoods.Gaussian()
             >>> vsgp = gp.models.VariationalSparseGP(X, y, kernel, Xu, likelihood)
-            >>> svi = SVI(vsgp.model, vsgp.guide, optimizer, Trace_ELBO())
+            >>> optimizer = torch.optim.Adam(vsgp.parameters(), lr=0.01)
+            >>> loss_fn = pyro.infer.TraceMeanField_ELBO().differentiable_loss
             >>> batched_X, batched_y = X.split(split_size=10), y.split(split_size=10)
             >>> for Xi, yi in zip(batched_X, batched_y):
+            ...     optimizer.zero_grad()
             ...     vsgp.set_data(Xi, yi)
             ...     svi.step()  # doctest: +SKIP
+            ...     loss = loss_fn(vsgp.model, vsgp.guide)  # doctest: +SKIP
+            ...     loss.backward()  # doctest: +SKIP
+            ...     optimizer.step()
 
         + Making a two-layer Gaussian Process stochastic function:
 
-
-            >>> gpr1 = gp.models.GPRegression(X, None, kernel, name="GPR1")
+            >>> gpr1 = gp.models.GPRegression(X, None, kernel)
             >>> Z, _ = gpr1.model()
-            >>> gpr2 = gp.models.GPRegression(Z, y, kernel, name="GPR2")
+            >>> gpr2 = gp.models.GPRegression(Z, y, kernel)
             >>> def two_layer_model():
             ...     Z, _ = gpr1.model()
             ...     gpr2.set_data(Z, y)
@@ -181,36 +184,12 @@ class GPModel(Parameterized):
         :param torch.Tensor y: An output data for training. Its last dimension is the
             number of data points.
         """
-        if y is not None and X.shape[0] != y.shape[-1]:
+        if y is not None and X.size(0) != y.size(-1):
             raise ValueError("Expected the number of input data points equal to the "
                              "number of output data points, but got {} and {}."
-                             .format(X.shape[0], y.shape[-1]))
+                             .format(X.size(0), y.size(-1)))
         self.X = X
         self.y = y
-
-    def optimize(self, optimizer=None, loss=None, num_steps=1000):
-        """
-        A convenient method to optimize parameters for the Gaussian Process model
-        using :class:`~pyro.infer.svi.SVI`.
-
-        :param PyroOptim optimizer: A Pyro optimizer.
-        :param ELBO loss: A Pyro loss instance.
-        :param int num_steps: Number of steps to run SVI.
-        :returns: a list of losses during the training procedure
-        :rtype: list
-        """
-        if optimizer is None:
-            optimizer = Adam({})
-        if not isinstance(optimizer, PyroOptim):
-            raise ValueError("Optimizer should be an instance of "
-                             "pyro.optim.PyroOptim class.")
-        if loss is None:
-            loss = Trace_ELBO()
-        svi = SVI(self.model, self.guide, optimizer, loss=loss)
-        losses = []
-        for i in range(num_steps):
-            losses.append(svi.step())
-        return losses
 
     def _check_Xnew_shape(self, Xnew):
         """
